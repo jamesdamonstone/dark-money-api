@@ -41,7 +41,7 @@ export default async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(origin) });
   if (path === "/health") return json({ ok: true, service: "dark-money-join" }, 200, origin);
 
-  const store = getStore("members");
+    const store = getStore({ name: "members", consistency: "strong" });
 
   if (path === "/join" && req.method === "POST") {
     let data;
