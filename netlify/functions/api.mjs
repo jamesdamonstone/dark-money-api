@@ -1,3 +1,12 @@
+// Dark Money — join + member registry API (Netlify Function + Netlify Blobs)
+// Store: Blobs store "members". Routes (via /api/* redirect):
+//   POST /api/join          {name, email, style, payout, terms} -> {ok, member_id, app_url}
+//   POST /api/login         {email, member_id}                  -> {ok, member} (email + ID must match)
+//   GET  /api/member?id=dm_xxx | ?email=a@b.c                   -> {ok, member} (public fields only)
+//   GET  /api/admin/members  header x-admin-key: $ADMIN_KEY     -> {ok, count, members, totals}
+//   GET  /api/health                                            -> {ok:true}
+// Member IDs: "dm_" + 10 chars (same format as the local link service).
+// Balances are NOT stored here in v1 — the local ledger stays the money source of truth.
 import { getStore } from "@netlify/blobs";
 
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
@@ -9,7 +18,7 @@ function cors(origin) {
   return {
     "Access-Control-Allow-Origin": allow,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, X-Admin-Key",
     "Vary": "Origin",
   };
 }
@@ -33,6 +42,10 @@ function validEmail(e) {
   return typeof e === "string" && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e) && e.length <= 254;
 }
 
+function publicMember(m) {
+  return { member_id: m.member_id, name: m.name, joined_at: m.joined_at, style: m.style };
+}
+
 export default async (req) => {
   const url = new URL(req.url);
   const origin = req.headers.get("origin") || "";
@@ -41,7 +54,7 @@ export default async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(origin) });
   if (path === "/health") return json({ ok: true, service: "dark-money-join" }, 200, origin);
 
-    const store = getStore({ name: "members", consistency: "strong" });
+  const store = getStore({ name: "members", consistency: "strong" });
 
   if (path === "/join" && req.method === "POST") {
     let data;
@@ -79,6 +92,23 @@ export default async (req) => {
     return json({ ok: true, member_id: memberId, existing: false, app_url: APP_BASE + "#" + memberId }, 201, origin);
   }
 
+  if (path === "/login" && req.method === "POST") {
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+
+    const email = (data.email || "").toString().trim().toLowerCase().slice(0, 254);
+    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+
+    // One generic failure for both unknown email and mismatched ID — never say which.
+    if (!validEmail(email) || !memberId) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+    const byEmail = await store.get("email:" + email);
+    if (!byEmail || byEmail !== memberId) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+    const m = JSON.parse(raw);
+    return json({ ok: true, member: { ...publicMember(m), payout: m.payout } }, 200, origin);
+  }
+
   if (path === "/member" && req.method === "GET") {
     let memberId = url.searchParams.get("id");
     const email = (url.searchParams.get("email") || "").trim().toLowerCase();
@@ -87,7 +117,31 @@ export default async (req) => {
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
     const m = JSON.parse(raw);
-    return json({ ok: true, member: { member_id: m.member_id, name: m.name, joined_at: m.joined_at, style: m.style } }, 200, origin);
+    return json({ ok: true, member: publicMember(m) }, 200, origin);
+  }
+
+  if (path === "/admin/members" && req.method === "GET") {
+    const adminKey = (typeof Netlify !== "undefined" && Netlify.env && Netlify.env.get("ADMIN_KEY")) || process.env.ADMIN_KEY || "";
+    const given = req.headers.get("x-admin-key") || "";
+    if (!adminKey || !given || given !== adminKey) {
+      return json({ ok: false, error: "unauthorized" }, 401, origin);
+    }
+    const listing = await store.list({ prefix: "id:" });
+    const members = [];
+    for (const blob of listing.blobs) {
+      const raw = await store.get(blob.key);
+      if (!raw) continue;
+      try { members.push(JSON.parse(raw)); } catch { /* skip corrupt record */ }
+    }
+    members.sort((a, b) => (b.joined_at || "").localeCompare(a.joined_at || ""));
+    const totals = { by_style: {}, by_payout: {}, joined_today: 0 };
+    const today = new Date().toISOString().slice(0, 10);
+    for (const m of members) {
+      totals.by_style[m.style] = (totals.by_style[m.style] || 0) + 1;
+      totals.by_payout[m.payout] = (totals.by_payout[m.payout] || 0) + 1;
+      if ((m.joined_at || "").slice(0, 10) === today) totals.joined_today += 1;
+    }
+    return json({ ok: true, count: members.length, totals, members }, 200, origin);
   }
 
   return json({ ok: false, error: "route_not_found" }, 404, origin);
