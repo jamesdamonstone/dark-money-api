@@ -135,11 +135,13 @@ export default async (req) => {
     }
     members.sort((a, b) => (b.joined_at || "").localeCompare(a.joined_at || ""));
     const totals = { by_style: {}, by_payout: {}, joined_today: 0 };
-    const today = new Date().toISOString().slice(0, 10);
+    // "Today" in the business's timezone (America/Chicago), not UTC.
+    const chicagoDay = (iso) => new Intl.DateTimeFormat("en-CA", { timeZone: "America/Chicago" }).format(new Date(iso));
+    const today = chicagoDay(new Date().toISOString());
     for (const m of members) {
       totals.by_style[m.style] = (totals.by_style[m.style] || 0) + 1;
       totals.by_payout[m.payout] = (totals.by_payout[m.payout] || 0) + 1;
-      if ((m.joined_at || "").slice(0, 10) === today) totals.joined_today += 1;
+      if (m.joined_at && chicagoDay(m.joined_at) === today) totals.joined_today += 1;
     }
     return json({ ok: true, count: members.length, totals, members }, 200, origin);
   }
