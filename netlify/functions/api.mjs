@@ -7,7 +7,12 @@
 //   POST /api/payout-request {member_id}                        -> {ok, requested_at} (queues a payout request; no money moves)
 //   GET  /api/admin/payout-requests  header x-admin-key         -> {ok, count, requests}
 //   POST /api/admin/payout-sent {member_id}  header x-admin-key -> {ok} (marks a request sent, clearing the queue entry)
+//   POST /api/checkin       {member_id, date}                   -> {ok, streak, bonus_pct, share_pct} (daily loyalty check-in; date = member's local YYYY-MM-DD)
+//   GET  /api/loyalty?id=dm_xxx[&date=YYYY-MM-DD]               -> {ok, streak, bonus_pct, share_pct, lapsed}
 //   GET  /api/health                                            -> {ok:true}
+// Loyalty (James's schedule, Nov 22, 2026): daily check-ins build a streak. Day 2 earns +0.1%
+// commission share; each further full week of streak adds +0.1%, capped at +5% (share max 75%).
+// Missing a day resets the streak and the bonus to zero.
 // Member IDs: "dm_" + 10 chars (same format as the local link service).
 // Balances are NOT stored here in v1 — the local ledger stays the money source of truth.
 import { getStore } from "@netlify/blobs";
@@ -47,6 +52,37 @@ function validEmail(e) {
 
 function publicMember(m) {
   return { member_id: m.member_id, name: m.name, joined_at: m.joined_at, style: m.style };
+}
+
+function validDay(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s + "T00:00:00Z"));
+}
+
+function shiftDay(dateStr, delta) {
+  const parts = dateStr.split("-").map(Number);
+  const t = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]) + delta * 86400000);
+  return t.toISOString().slice(0, 10);
+}
+
+function loyaltyBonus(streak) {
+  if (!streak || streak < 2) return 0;
+  const b = 0.1 + 0.1 * Math.floor((streak - 2) / 7);
+  return Math.round(Math.min(5, b) * 10) / 10;
+}
+
+function loyaltyView(rec, todayStr) {
+  if (!rec) return { streak: 0, bonus_pct: 0, share_pct: 70, last_date: null, total_checkins: 0, lapsed: false };
+  let streak = rec.streak || 0;
+  let lapsed = false;
+  if (todayStr && rec.last_date && rec.last_date < shiftDay(todayStr, -1)) {
+    streak = 0;
+    lapsed = true;
+  }
+  const bonus = loyaltyBonus(streak);
+  return {
+    streak, bonus_pct: bonus, share_pct: Math.round((70 + bonus) * 10) / 10,
+    last_date: rec.last_date || null, total_checkins: rec.total_checkins || 0, lapsed,
+  };
 }
 
 export default async (req) => {
@@ -146,6 +182,12 @@ export default async (req) => {
       totals.by_payout[m.payout] = (totals.by_payout[m.payout] || 0) + 1;
       if (m.joined_at && chicagoDay(m.joined_at) === today) totals.joined_today += 1;
     }
+    for (const m of members) {
+      let rec = null;
+      const recRaw = await store.get("loyalty:" + m.member_id);
+      if (recRaw) { try { rec = JSON.parse(recRaw); } catch { rec = null; } }
+      m.loyalty = loyaltyView(rec, null);
+    }
     return json({ ok: true, count: members.length, totals, members }, 200, origin);
   }
 
@@ -211,6 +253,52 @@ export default async (req) => {
     record.sent_at = new Date().toISOString();
     await store.set("payout:" + memberId, JSON.stringify(record));
     return json({ ok: true, member_id: memberId, sent_at: record.sent_at }, 200, origin);
+  }
+
+  if (path === "/checkin" && req.method === "POST") {
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+
+    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    const date = (data.date || "").toString().trim().slice(0, 10);
+    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    if (!validDay(date)) return json({ ok: false, error: "invalid_date" }, 400, origin);
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "invalid_member" }, 404, origin);
+
+    let rec = null;
+    const recRaw = await store.get("loyalty:" + memberId);
+    if (recRaw) { try { rec = JSON.parse(recRaw); } catch { rec = null; } }
+    if (!rec) rec = { streak: 0, last_date: null, total_checkins: 0 };
+
+    let already = false;
+    if (rec.last_date === date) {
+      already = true;
+    } else if (rec.last_date === shiftDay(date, -1)) {
+      rec.streak = (rec.streak || 0) + 1;
+      rec.last_date = date;
+      rec.total_checkins = (rec.total_checkins || 0) + 1;
+    } else {
+      // First ever check-in, or a missed day — the streak (re)starts at 1.
+      rec.streak = 1;
+      rec.last_date = date;
+      rec.total_checkins = (rec.total_checkins || 0) + 1;
+    }
+    await store.set("loyalty:" + memberId, JSON.stringify(rec));
+    const view = loyaltyView(rec, date);
+    return json({ ok: true, already_checked_in: already, ...view }, 200, origin);
+  }
+
+  if (path === "/loyalty" && req.method === "GET") {
+    const memberId = (url.searchParams.get("id") || "").trim();
+    const date = (url.searchParams.get("date") || "").trim().slice(0, 10);
+    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
+    let rec = null;
+    const recRaw = await store.get("loyalty:" + memberId);
+    if (recRaw) { try { rec = JSON.parse(recRaw); } catch { rec = null; } }
+    return json({ ok: true, member_id: memberId, ...loyaltyView(rec, validDay(date) ? date : null) }, 200, origin);
   }
 
   return json({ ok: false, error: "route_not_found" }, 404, origin);
