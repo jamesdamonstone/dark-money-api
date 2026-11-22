@@ -4,6 +4,9 @@
 //   POST /api/login         {email, member_id}                  -> {ok, member} (email + ID must match)
 //   GET  /api/member?id=dm_xxx | ?email=a@b.c                   -> {ok, member} (public fields only)
 //   GET  /api/admin/members  header x-admin-key: $ADMIN_KEY     -> {ok, count, members, totals}
+//   POST /api/payout-request {member_id}                        -> {ok, requested_at} (queues a payout request; no money moves)
+//   GET  /api/admin/payout-requests  header x-admin-key         -> {ok, count, requests}
+//   POST /api/admin/payout-sent {member_id}  header x-admin-key -> {ok} (marks a request sent, clearing the queue entry)
 //   GET  /api/health                                            -> {ok:true}
 // Member IDs: "dm_" + 10 chars (same format as the local link service).
 // Balances are NOT stored here in v1 — the local ledger stays the money source of truth.
@@ -144,6 +147,70 @@ export default async (req) => {
       if (m.joined_at && chicagoDay(m.joined_at) === today) totals.joined_today += 1;
     }
     return json({ ok: true, count: members.length, totals, members }, 200, origin);
+  }
+
+  if (path === "/payout-request" && req.method === "POST") {
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+
+    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "invalid_member" }, 404, origin);
+    const m = JSON.parse(raw);
+
+    // One open request per member — a second tap returns the existing request.
+    const existingRaw = await store.get("payout:" + memberId);
+    if (existingRaw) {
+      try {
+        const existing = JSON.parse(existingRaw);
+        if (existing.status === "requested") {
+          return json({ ok: true, existing: true, requested_at: existing.requested_at }, 200, origin);
+        }
+      } catch { /* fall through and record a fresh request */ }
+    }
+
+    const record = {
+      member_id: memberId, name: m.name, email: m.email, payout: m.payout,
+      requested_at: new Date().toISOString(), status: "requested",
+    };
+    await store.set("payout:" + memberId, JSON.stringify(record));
+    return json({ ok: true, existing: false, requested_at: record.requested_at }, 201, origin);
+  }
+
+  if (path === "/admin/payout-requests" && req.method === "GET") {
+    const adminKey = (typeof Netlify !== "undefined" && Netlify.env && Netlify.env.get("ADMIN_KEY")) || process.env.ADMIN_KEY || "";
+    const given = req.headers.get("x-admin-key") || "";
+    if (!adminKey || !given || given !== adminKey) {
+      return json({ ok: false, error: "unauthorized" }, 401, origin);
+    }
+    const listing = await store.list({ prefix: "payout:" });
+    const requests = [];
+    for (const blob of listing.blobs) {
+      const raw = await store.get(blob.key);
+      if (!raw) continue;
+      try { requests.push(JSON.parse(raw)); } catch { /* skip corrupt record */ }
+    }
+    requests.sort((a, b) => (a.requested_at || "").localeCompare(b.requested_at || ""));
+    return json({ ok: true, count: requests.length, requests }, 200, origin);
+  }
+
+  if (path === "/admin/payout-sent" && req.method === "POST") {
+    const adminKey = (typeof Netlify !== "undefined" && Netlify.env && Netlify.env.get("ADMIN_KEY")) || process.env.ADMIN_KEY || "";
+    const given = req.headers.get("x-admin-key") || "";
+    if (!adminKey || !given || given !== adminKey) {
+      return json({ ok: false, error: "unauthorized" }, 401, origin);
+    }
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    const raw = await store.get("payout:" + memberId);
+    if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
+    const record = JSON.parse(raw);
+    record.status = "sent";
+    record.sent_at = new Date().toISOString();
+    await store.set("payout:" + memberId, JSON.stringify(record));
+    return json({ ok: true, member_id: memberId, sent_at: record.sent_at }, 200, origin);
   }
 
   return json({ ok: false, error: "route_not_found" }, 404, origin);
