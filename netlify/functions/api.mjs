@@ -9,6 +9,8 @@
 //   POST /api/admin/payout-sent {member_id}  header x-admin-key -> {ok} (marks a request sent, clearing the queue entry)
 //   POST /api/checkin       {member_id, date}                   -> {ok, streak, bonus_pct, share_pct} (daily loyalty check-in; date = member's local YYYY-MM-DD)
 //   GET  /api/loyalty?id=dm_xxx[&date=YYYY-MM-DD]               -> {ok, streak, bonus_pct, share_pct, lapsed}
+//   GET  /api/purchases?id=dm_xxx                               -> {ok, purchases, totals} (member's tracked purchases + balance totals)
+//   POST /api/admin/purchases {member_id, purchases[]} header x-admin-key -> {ok, count} (replaces the member's purchase snapshot; fed by ledger reconciliation)
 //   GET  /api/health                                            -> {ok:true}
 // Loyalty (James's schedule, Nov 22, 2026): daily check-ins build a streak. Day 2 earns +0.1%
 // commission share; each further full week of streak adds +0.1%, capped at +5% (share max 75%).
@@ -299,6 +301,50 @@ export default async (req) => {
     const recRaw = await store.get("loyalty:" + memberId);
     if (recRaw) { try { rec = JSON.parse(recRaw); } catch { rec = null; } }
     return json({ ok: true, member_id: memberId, ...loyaltyView(rec, validDay(date) ? date : null) }, 200, origin);
+  }
+
+  if (path === "/purchases" && req.method === "GET") {
+    const memberId = (url.searchParams.get("id") || "").trim();
+    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
+    let purchases = [];
+    const pRaw = await store.get("purchases:" + memberId);
+    if (pRaw) { try { const parsed = JSON.parse(pRaw); if (Array.isArray(parsed)) purchases = parsed; } catch { purchases = []; } }
+    const totals = { pending: 0, confirmed: 0, paid: 0 };
+    for (const p of purchases) {
+      if (totals[p.status] !== undefined) totals[p.status] = Math.round((totals[p.status] + (p.member_share || 0)) * 100) / 100;
+    }
+    return json({ ok: true, member_id: memberId, purchases, totals }, 200, origin);
+  }
+
+  if (path === "/admin/purchases" && req.method === "POST") {
+    const adminKey = (typeof Netlify !== "undefined" && Netlify.env && Netlify.env.get("ADMIN_KEY")) || process.env.ADMIN_KEY || "";
+    const given = req.headers.get("x-admin-key") || "";
+    if (!adminKey || !given || given !== adminKey) {
+      return json({ ok: false, error: "unauthorized" }, 401, origin);
+    }
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "invalid_member" }, 404, origin);
+    if (!Array.isArray(data.purchases) || data.purchases.length > 500) {
+      return json({ ok: false, error: "invalid_purchases" }, 400, origin);
+    }
+    const money = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) / 100 : 0; };
+    const clean = data.purchases.map((p, i) => ({
+      id: (p && p.id ? String(p.id) : "purchase_" + (i + 1)).slice(0, 80),
+      store: (p && p.store ? String(p.store) : "Store").slice(0, 120),
+      date: validDay(p && p.date) ? p.date : null,
+      sale_amount: money(p && p.sale_amount),
+      commission: money(p && p.commission),
+      member_share: money(p && p.member_share),
+      status: ["pending", "confirmed", "paid", "reversed"].includes(p && p.status) ? p.status : "pending",
+    }));
+    await store.set("purchases:" + memberId, JSON.stringify(clean));
+    return json({ ok: true, member_id: memberId, count: clean.length }, 200, origin);
   }
 
   return json({ ok: false, error: "route_not_found" }, 404, origin);
