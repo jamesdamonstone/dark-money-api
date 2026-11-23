@@ -20,8 +20,8 @@
 import { getStore } from "@netlify/blobs";
 
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
-const APP_BASE = "https://jamesdamonstone.github.io/dark-money/app.html";
-const ALLOWED_ORIGINS = ["https://jamesdamonstone.github.io", "http://localhost:8000", "http://127.0.0.1:8000"];
+const APP_BASE = "https://darkmoney.strangefawkes.com/app.html";
+const ALLOWED_ORIGINS = ["https://darkmoney.strangefawkes.com", "https://strangefawkes.com", "https://jamesdamonstone.github.io", "http://localhost:8000", "http://127.0.0.1:8000"];
 
 function cors(origin) {
   const allow = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
