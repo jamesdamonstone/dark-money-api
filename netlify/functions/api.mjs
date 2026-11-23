@@ -1,7 +1,8 @@
 // Dark Money — join + member registry API (Netlify Function + Netlify Blobs)
 // Store: Blobs store "members". Routes (via /api/* redirect):
 //   POST /api/join          {name, email, style, payout, terms} -> {ok, member_id, app_url}
-//   POST /api/login         {email, member_id}                  -> {ok, member} (email + ID must match)
+//   POST /api/login         {email, member_id} or {email, password} -> {ok, member} (email + ID must match, or the member's password)
+//   POST /api/set-password  {member_id, password}               -> {ok} (sets/replaces the member's login password; the member ID is the credential, same as every member route)
 //   GET  /api/member?id=dm_xxx | ?email=a@b.c                   -> {ok, member} (public fields only)
 //   GET  /api/admin/members  header x-admin-key: $ADMIN_KEY     -> {ok, count, members, totals}
 //   POST /api/payout-request {member_id}                        -> {ok, requested_at} (queues a payout request; no money moves)
@@ -53,7 +54,52 @@ function validEmail(e) {
 }
 
 function publicMember(m) {
-  return { member_id: m.member_id, name: m.name, joined_at: m.joined_at, style: m.style };
+  return { member_id: m.member_id, name: m.name, joined_at: m.joined_at, style: m.style, has_password: !!m.pw };
+}
+
+// Passwords: PBKDF2-SHA256 via WebCrypto. Only the derived hash + salt are stored
+// (on the member record as m.pw); the hash never leaves the server.
+const PW_ITERATIONS = 100000;
+
+function b64(bytes) {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+
+function unb64(str) {
+  const s = atob(str);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+
+async function hashPassword(password, saltBytes, iterations) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: saltBytes, iterations, hash: "SHA-256" }, key, 256);
+  return new Uint8Array(bits);
+}
+
+async function makePasswordRecord(password) {
+  const salt = new Uint8Array(16);
+  crypto.getRandomValues(salt);
+  const hash = await hashPassword(password, salt, PW_ITERATIONS);
+  return { algo: "pbkdf2-sha256", iter: PW_ITERATIONS, salt: b64(salt), hash: b64(hash), set_at: new Date().toISOString() };
+}
+
+async function checkPassword(password, rec) {
+  if (!rec || !rec.salt || !rec.hash) return false;
+  const hash = await hashPassword(password, unb64(rec.salt), rec.iter || PW_ITERATIONS);
+  const expected = unb64(rec.hash);
+  if (hash.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < hash.length; i++) diff |= hash[i] ^ expected[i];
+  return diff === 0;
+}
+
+function validPassword(p) {
+  return typeof p === "string" && p.length >= 8 && p.length <= 200;
 }
 
 function validDay(s) {
@@ -139,15 +185,45 @@ export default async (req) => {
 
     const email = (data.email || "").toString().trim().toLowerCase().slice(0, 254);
     const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    const password = typeof data.password === "string" ? data.password : "";
 
-    // One generic failure for both unknown email and mismatched ID — never say which.
-    if (!validEmail(email) || !memberId) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+    if (!validEmail(email)) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
     const byEmail = await store.get("email:" + email);
+
+    // Password login: email + the password the member set in Account.
+    if (password) {
+      if (!byEmail) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+      const raw = await store.get("id:" + byEmail);
+      if (!raw) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+      const m = JSON.parse(raw);
+      if (!m.pw) return json({ ok: false, error: "no_password_set" }, 401, origin);
+      if (!(await checkPassword(password, m.pw))) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+      return json({ ok: true, member: { ...publicMember(m), payout: m.payout } }, 200, origin);
+    }
+
+    // Member-ID login (the original path). One generic failure for both unknown
+    // email and mismatched ID — never say which.
+    if (!memberId) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
     if (!byEmail || byEmail !== memberId) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
     const m = JSON.parse(raw);
     return json({ ok: true, member: { ...publicMember(m), payout: m.payout } }, 200, origin);
+  }
+
+  if (path === "/set-password" && req.method === "POST") {
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+
+    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    if (!validPassword(data.password)) return json({ ok: false, error: "password_too_short" }, 400, origin);
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "invalid_member" }, 404, origin);
+    const m = JSON.parse(raw);
+    m.pw = await makePasswordRecord(data.password);
+    await store.set("id:" + memberId, JSON.stringify(m));
+    return json({ ok: true, member_id: memberId, has_password: true }, 200, origin);
   }
 
   if (path === "/member" && req.method === "GET") {
@@ -185,6 +261,8 @@ export default async (req) => {
       if (m.joined_at && chicagoDay(m.joined_at) === today) totals.joined_today += 1;
     }
     for (const m of members) {
+      m.has_password = !!m.pw;
+      delete m.pw; // password hashes never leave the server, not even to the owner view
       let rec = null;
       const recRaw = await store.get("loyalty:" + m.member_id);
       if (recRaw) { try { rec = JSON.parse(recRaw); } catch { rec = null; } }
