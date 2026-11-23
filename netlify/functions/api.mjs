@@ -1,6 +1,6 @@
 // Dark Money — join + member registry API (Netlify Function + Netlify Blobs)
 // Store: Blobs store "members". Routes (via /api/* redirect):
-//   POST /api/join          {name, email, style, payout, terms} -> {ok, member_id, app_url}
+//   POST /api/join          {name, email, style, payout, terms, ref?} -> {ok, member_id, app_url}
 //   POST /api/login         {email, member_id} or {email, password} -> {ok, member} (email + ID must match, or the member's password)
 //   POST /api/set-password  {member_id, password}               -> {ok} (sets/replaces the member's login password; the member ID is the credential, same as every member route)
 //   GET  /api/member?id=dm_xxx | ?email=a@b.c                   -> {ok, member} (public fields only)
@@ -16,6 +16,10 @@
 // Loyalty (James's schedule, Nov 22, 2026): daily check-ins build a streak. Day 2 earns +0.1%
 // commission share; each further full week of streak adds +0.1%, capped at +5% (share max 75%).
 // Missing a day resets the streak and the bonus to zero.
+// Referrals (Nov 23, 2026): join accepts an optional `ref` — the referring member's ID.
+// It is validated against the registry and stored on the new record as `referred_by`.
+// Login, member and admin payloads report referral_count plus the referred members'
+// first names. Plumbing only — no referral bonus or payout change rides on it yet.
 // Member IDs: "dm_" + 10 chars (same format as the local link service).
 // Balances are NOT stored here in v1 — the local ledger stays the money source of truth.
 import { getStore } from "@netlify/blobs";
@@ -55,6 +59,25 @@ function validEmail(e) {
 
 function publicMember(m) {
   return { member_id: m.member_id, name: m.name, joined_at: m.joined_at, style: m.style, has_password: !!m.pw };
+}
+
+// Referral view for one member: everyone whose record points back at them.
+// First names only — that is all the member-facing payloads ever show.
+async function referralInfo(store, memberId) {
+  const listing = await store.list({ prefix: "id:" });
+  const referrals = [];
+  for (const blob of listing.blobs) {
+    const raw = await store.get(blob.key);
+    if (!raw) continue;
+    try {
+      const m = JSON.parse(raw);
+      if (m.referred_by === memberId) {
+        referrals.push({ name: (m.name || "").trim().split(/\s+/)[0] || "", joined_at: m.joined_at || null });
+      }
+    } catch { /* skip corrupt record */ }
+  }
+  referrals.sort((a, b) => (a.joined_at || "").localeCompare(b.joined_at || ""));
+  return { referral_count: referrals.length, referrals };
 }
 
 // Passwords: PBKDF2-SHA256 via WebCrypto. Only the derived hash + salt are stored
@@ -151,6 +174,7 @@ export default async (req) => {
     const email = (data.email || "").toString().trim().toLowerCase().slice(0, 254);
     const style = data.style === "agent" ? "agent" : "self";
     const payout = ["paypal", "venmo", "cashapp", "later"].includes(data.payout) ? data.payout : "later";
+    const ref = (data.ref || "").toString().trim().slice(0, 40);
 
     if (!name) return json({ ok: false, error: "name_required" }, 400, origin);
     if (!validEmail(email)) return json({ ok: false, error: "email_invalid" }, 400, origin);
@@ -169,9 +193,15 @@ export default async (req) => {
     }
     if (!memberId) return json({ ok: false, error: "id_failed" }, 500, origin);
 
+    // Optional referral: keep it only if it names a member who already exists.
+    // (An existing-email re-join returns above and never rewrites referred_by.)
+    let referredBy = null;
+    if (/^dm_[A-Za-z0-9]{10}$/.test(ref) && (await store.get("id:" + ref))) referredBy = ref;
+
     const member = {
       member_id: memberId, name, email, style, payout,
       terms_agreed: true, joined_at: new Date().toISOString(), source: "website",
+      ...(referredBy ? { referred_by: referredBy } : {}),
     };
     await store.set("id:" + memberId, JSON.stringify(member));
     await store.set("email:" + email, memberId);
@@ -198,7 +228,7 @@ export default async (req) => {
       const m = JSON.parse(raw);
       if (!m.pw) return json({ ok: false, error: "no_password_set" }, 401, origin);
       if (!(await checkPassword(password, m.pw))) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
-      return json({ ok: true, member: { ...publicMember(m), payout: m.payout } }, 200, origin);
+      return json({ ok: true, member: { ...publicMember(m), payout: m.payout, ...(await referralInfo(store, m.member_id)) } }, 200, origin);
     }
 
     // Member-ID login (the original path). One generic failure for both unknown
@@ -208,7 +238,7 @@ export default async (req) => {
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
     const m = JSON.parse(raw);
-    return json({ ok: true, member: { ...publicMember(m), payout: m.payout } }, 200, origin);
+    return json({ ok: true, member: { ...publicMember(m), payout: m.payout, ...(await referralInfo(store, m.member_id)) } }, 200, origin);
   }
 
   if (path === "/set-password" && req.method === "POST") {
@@ -234,7 +264,7 @@ export default async (req) => {
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
     const m = JSON.parse(raw);
-    return json({ ok: true, member: publicMember(m) }, 200, origin);
+    return json({ ok: true, member: { ...publicMember(m), ...(await referralInfo(store, m.member_id)) } }, 200, origin);
   }
 
   if (path === "/admin/members" && req.method === "GET") {
@@ -267,6 +297,19 @@ export default async (req) => {
       const recRaw = await store.get("loyalty:" + m.member_id);
       if (recRaw) { try { rec = JSON.parse(recRaw); } catch { rec = null; } }
       m.loyalty = loyaltyView(rec, null);
+    }
+    // Referral counts in a single pass over the loaded records (referred_by is
+    // already on each record; first names only, matching the member payloads).
+    const byReferrer = {};
+    for (const m of members) {
+      if (m.referred_by) (byReferrer[m.referred_by] = byReferrer[m.referred_by] || []).push(m);
+    }
+    for (const m of members) {
+      const list = byReferrer[m.member_id] || [];
+      m.referral_count = list.length;
+      m.referrals = list.map((r) => ({
+        name: (r.name || "").trim().split(/\s+/)[0] || "", joined_at: r.joined_at || null,
+      }));
     }
     return json({ ok: true, count: members.length, totals, members }, 200, origin);
   }
