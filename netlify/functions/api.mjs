@@ -1,7 +1,8 @@
 // Dark Money — join + member registry API (Netlify Function + Netlify Blobs)
 // Store: Blobs store "members". Routes (via /api/* redirect):
-//   POST /api/join          {name, email, style, payout, terms, ref?} -> {ok, member_id, app_url}
-//   POST /api/login         {email, member_id} or {email, password} -> {ok, member} (email + ID must match, or the member's password)
+//   POST /api/join          {name, email, style, payout, terms, ref?, password?} -> {ok, member_id, app_url}
+//   POST /api/login         {email, member_id} or {email, password} -> {ok, member} (email + ID must match, or the member's password;
+//                           ID login is refused with "password_required" once the member has a password; failed logins are throttled)
 //   POST /api/set-password  {member_id, password}               -> {ok} (sets/replaces the member's login password; the member ID is the credential, same as every member route)
 //   GET  /api/member?id=dm_xxx | ?email=a@b.c                   -> {ok, member} (public fields only)
 //   GET  /api/admin/members  header x-admin-key: $ADMIN_KEY     -> {ok, count, members, totals}
@@ -28,8 +29,12 @@
 // Loyalty (James's schedule, Nov 22, 2026): daily check-ins build a streak. Day 2 earns +0.1%
 // commission share; each further full week of streak adds +0.1%, capped at +5% (share max 75%).
 // Missing a day resets the streak and the bonus to zero.
-// Referrals (Nov 23, 2026): join accepts an optional `ref` — the referring member's ID.
-// It is validated against the registry and stored on the new record as `referred_by`.
+// Referrals (Nov 23, 2026): join accepts an optional `ref` — originally the referring
+// member's ID. It is validated against the registry and stored on the new record as
+// `referred_by`. (Nov 24, 2026): every member now also has a public referral code
+// (`ref_code`, "dmr_" + 8 chars) so invite links never expose the member ID, which
+// doubles as a login credential. Join accepts a ref_code OR a legacy member ID and
+// records `referred_by` as the referrer's member ID either way.
 // Login, member and admin payloads report referral_count plus the referred members'
 // first names. Plumbing only — no referral bonus or payout change rides on it yet.
 // Member IDs: "dm_" + 10 chars (same format as the local link service).
@@ -65,12 +70,65 @@ function newMemberId() {
   return id;
 }
 
+// Referral codes: "dmr_" + 8 chars from the same unambiguous alphabet. Public —
+// safe to print in invite links, unlike the member ID.
+function newRefCode() {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  let code = "dmr_";
+  for (const b of bytes) code += ALPHABET[b % ALPHABET.length];
+  return code;
+}
+
+// Make sure a member record carries a ref_code, generating and indexing one if
+// not (records created before ref codes existed get theirs lazily, the first
+// time a payload needs it). The "refcode:" index maps code -> member_id so
+// join-time resolution never has to scan. Returns the code, or null if a
+// unique one could not be minted (payloads then just omit it).
+async function ensureRefCode(store, m) {
+  if (m && typeof m.ref_code === "string" && /^dmr_[A-Za-z0-9]{8}$/.test(m.ref_code)) return m.ref_code;
+  if (!m || !m.member_id) return null;
+  for (let i = 0; i < 5; i++) {
+    const candidate = newRefCode();
+    if (await store.get("refcode:" + candidate)) continue;
+    m.ref_code = candidate;
+    await store.set("id:" + m.member_id, JSON.stringify(m));
+    await store.set("refcode:" + candidate, m.member_id);
+    return candidate;
+  }
+  return null;
+}
+
+// Resolve a join `ref` to the referrer's member ID. Accepts a ref_code
+// (dmr_…) or a legacy member ID (dm_…) from older invite links; anything
+// else — or a code that names nobody — resolves to null and is dropped.
+async function resolveRef(store, ref) {
+  if (/^dm_[A-Za-z0-9]{10}$/.test(ref)) {
+    return (await store.get("id:" + ref)) ? ref : null;
+  }
+  if (/^dmr_[A-Za-z0-9]{8}$/.test(ref)) {
+    const byIndex = await store.get("refcode:" + ref);
+    if (byIndex) return byIndex;
+    // Fall back to a scan in case an index entry is missing.
+    const listing = await store.list({ prefix: "id:" });
+    for (const blob of listing.blobs) {
+      const raw = await store.get(blob.key);
+      if (!raw) continue;
+      try {
+        const m = JSON.parse(raw);
+        if (m.ref_code === ref) return m.member_id;
+      } catch { /* skip corrupt record */ }
+    }
+  }
+  return null;
+}
+
 function validEmail(e) {
   return typeof e === "string" && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e) && e.length <= 254;
 }
 
 function publicMember(m) {
-  return { member_id: m.member_id, name: m.name, joined_at: m.joined_at, style: m.style, has_password: !!m.pw };
+  return { member_id: m.member_id, name: m.name, joined_at: m.joined_at, style: m.style, has_password: !!m.pw, ref_code: m.ref_code || null };
 }
 
 // Referral view for one member: everyone whose record points back at them.
@@ -137,6 +195,57 @@ function validPassword(p) {
   return typeof p === "string" && p.length >= 8 && p.length <= 200;
 }
 
+// Login throttling: failed-attempt timestamps live in the "security" Blobs
+// store, keyed per email and per client IP. After 5 failures for one email
+// (or 20 from one IP) inside a rolling 15-minute window, /login answers 429
+// until the window passes. A successful login clears the email's counter.
+// Every helper swallows store errors — throttling must never break login.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_EMAIL_LIMIT = 5;
+const LOGIN_IP_LIMIT = 20;
+
+function clientIp(req) {
+  const nf = req.headers.get("x-nf-client-connection-ip");
+  if (nf && nf.trim()) return nf.trim().slice(0, 64);
+  const xff = (req.headers.get("x-forwarded-for") || "").split(",")[0].trim();
+  return xff ? xff.slice(0, 64) : "unknown";
+}
+
+async function loadFailList(secStore, key) {
+  try {
+    const raw = await secStore.get(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const cutoff = Date.now() - LOGIN_WINDOW_MS;
+    return parsed.filter((t) => typeof t === "number" && t > cutoff);
+  } catch { return []; }
+}
+
+async function loginThrottled(secStore, email, ip) {
+  try {
+    const byEmail = await loadFailList(secStore, "loginfail:email:" + email);
+    if (byEmail.length >= LOGIN_EMAIL_LIMIT) return true;
+    const byIp = await loadFailList(secStore, "loginfail:ip:" + ip);
+    return byIp.length >= LOGIN_IP_LIMIT;
+  } catch { return false; }
+}
+
+async function recordLoginFailure(secStore, email, ip) {
+  try {
+    const now = Date.now();
+    for (const key of ["loginfail:email:" + email, "loginfail:ip:" + ip]) {
+      const list = await loadFailList(secStore, key);
+      list.push(now);
+      await secStore.set(key, JSON.stringify(list));
+    }
+  } catch { /* never break login */ }
+}
+
+async function clearLoginFailures(secStore, email) {
+  try { await secStore.delete("loginfail:email:" + email); } catch { /* never break login */ }
+}
+
 function validDay(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s + "T00:00:00Z"));
 }
@@ -187,10 +296,14 @@ export default async (req) => {
     const style = data.style === "agent" ? "agent" : "self";
     const payout = ["paypal", "venmo", "cashapp", "later"].includes(data.payout) ? data.payout : "later";
     const ref = (data.ref || "").toString().trim().slice(0, 40);
+    // Optional: a password chosen at join time, stored exactly like one set
+    // later through /set-password. Absent/empty means no password yet.
+    const joinPassword = typeof data.password === "string" ? data.password : "";
 
     if (!name) return json({ ok: false, error: "name_required" }, 400, origin);
     if (!validEmail(email)) return json({ ok: false, error: "email_invalid" }, 400, origin);
     if (data.terms !== true) return json({ ok: false, error: "terms_required" }, 400, origin);
+    if (joinPassword && !validPassword(joinPassword)) return json({ ok: false, error: "password_too_short" }, 400, origin);
 
     const existing = await store.get("email:" + email);
     if (existing) {
@@ -206,17 +319,30 @@ export default async (req) => {
     if (!memberId) return json({ ok: false, error: "id_failed" }, 500, origin);
 
     // Optional referral: keep it only if it names a member who already exists.
+    // The ref may be the referrer's ref_code (current invite links) or their
+    // member ID (legacy links); either way referred_by stores the member ID.
     // (An existing-email re-join returns above and never rewrites referred_by.)
-    let referredBy = null;
-    if (/^dm_[A-Za-z0-9]{10}$/.test(ref) && (await store.get("id:" + ref))) referredBy = ref;
+    const referredBy = ref ? await resolveRef(store, ref) : null;
+
+    // Every member gets a public referral code of their own, indexed for
+    // join-time resolution. A mint failure is not fatal — ensureRefCode
+    // will generate one lazily on the member's first login/lookup.
+    let refCode = null;
+    for (let i = 0; i < 5 && !refCode; i++) {
+      const candidate = newRefCode();
+      if (!(await store.get("refcode:" + candidate))) refCode = candidate;
+    }
 
     const member = {
       member_id: memberId, name, email, style, payout,
       terms_agreed: true, joined_at: new Date().toISOString(), source: "website",
+      ...(refCode ? { ref_code: refCode } : {}),
       ...(referredBy ? { referred_by: referredBy } : {}),
+      ...(joinPassword ? { pw: await makePasswordRecord(joinPassword) } : {}),
     };
     await store.set("id:" + memberId, JSON.stringify(member));
     await store.set("email:" + email, memberId);
+    if (refCode) await store.set("refcode:" + refCode, memberId);
 
     return json({ ok: true, member_id: memberId, existing: false, app_url: APP_BASE + "#" + memberId }, 201, origin);
   }
@@ -229,27 +355,46 @@ export default async (req) => {
     const memberId = (data.member_id || "").toString().trim().slice(0, 40);
     const password = typeof data.password === "string" ? data.password : "";
 
-    if (!validEmail(email)) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+    // Throttle: too many recent failures for this email or from this IP and
+    // every further attempt waits out the window, right or wrong.
+    const secStore = getStore({ name: "security", consistency: "strong" });
+    const ip = clientIp(req);
+    if (await loginThrottled(secStore, email, ip)) {
+      return json({ ok: false, error: "too_many_attempts" }, 429, origin);
+    }
+    const fail = async (error, status) => {
+      await recordLoginFailure(secStore, email, ip);
+      return json({ ok: false, error }, status, origin);
+    };
+
+    if (!validEmail(email)) return fail("invalid_credentials", 401);
     const byEmail = await store.get("email:" + email);
 
     // Password login: email + the password the member set in Account.
     if (password) {
-      if (!byEmail) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+      if (!byEmail) return fail("invalid_credentials", 401);
       const raw = await store.get("id:" + byEmail);
-      if (!raw) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+      if (!raw) return fail("invalid_credentials", 401);
       const m = JSON.parse(raw);
       if (!m.pw) return json({ ok: false, error: "no_password_set" }, 401, origin);
-      if (!(await checkPassword(password, m.pw))) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+      if (!(await checkPassword(password, m.pw))) return fail("invalid_credentials", 401);
+      await clearLoginFailures(secStore, email);
+      await ensureRefCode(store, m);
       return json({ ok: true, member: { ...publicMember(m), payout: m.payout, ...(await referralInfo(store, m.member_id)) } }, 200, origin);
     }
 
     // Member-ID login (the original path). One generic failure for both unknown
-    // email and mismatched ID — never say which.
-    if (!memberId) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
-    if (!byEmail || byEmail !== memberId) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+    // email and mismatched ID — never say which. Once the member has a password,
+    // the ID alone no longer logs in: invite links used to print member IDs in
+    // public, so the ID is not a secret worth trusting on its own anymore.
+    if (!memberId) return fail("invalid_credentials", 401);
+    if (!byEmail || byEmail !== memberId) return fail("invalid_credentials", 401);
     const raw = await store.get("id:" + memberId);
-    if (!raw) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+    if (!raw) return fail("invalid_credentials", 401);
     const m = JSON.parse(raw);
+    if (m.pw) return json({ ok: false, error: "password_required" }, 401, origin);
+    await clearLoginFailures(secStore, email);
+    await ensureRefCode(store, m);
     return json({ ok: true, member: { ...publicMember(m), payout: m.payout, ...(await referralInfo(store, m.member_id)) } }, 200, origin);
   }
 
@@ -276,6 +421,7 @@ export default async (req) => {
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
     const m = JSON.parse(raw);
+    await ensureRefCode(store, m);
     return json({ ok: true, member: { ...publicMember(m), ...(await referralInfo(store, m.member_id)) } }, 200, origin);
   }
 
