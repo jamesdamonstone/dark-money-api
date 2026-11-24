@@ -12,7 +12,19 @@
 //   GET  /api/loyalty?id=dm_xxx[&date=YYYY-MM-DD]               -> {ok, streak, bonus_pct, share_pct, lapsed}
 //   GET  /api/purchases?id=dm_xxx                               -> {ok, purchases, totals} (member's tracked purchases + balance totals)
 //   POST /api/admin/purchases {member_id, purchases[]} header x-admin-key -> {ok, count} (replaces the member's purchase snapshot; fed by ledger reconciliation)
+//   GET  /api/local/businesses                                  -> {ok, businesses} (active local businesses, public fields)
+//   POST /api/local/claim  {member_id, business_id, amount, receipt} -> {ok, claim} (receipt = data URL photo; fingerprint blocks double-claims)
+//   GET  /api/local/claims?id=dm_xxx                            -> {ok, claims, totals} (the member's local claims)
+//   GET  /api/admin/local-businesses  header x-admin-key        -> {ok, businesses} (all, incl. inactive)
+//   POST /api/admin/local-businesses {businesses[]} header x-admin-key -> {ok, count} (replaces the local registry)
+//   GET  /api/admin/local-claims  header x-admin-key            -> {ok, count, claims} (all local claims, newest first)
+//   GET  /api/admin/local-receipt?id=lc_xxx  header x-admin-key -> {ok, receipt} (the claim's receipt photo data URL)
+//   POST /api/admin/local-claim-decide {claim_id, decision} header x-admin-key -> {ok, claim} (approve credits the member's purchases as confirmed)
 //   GET  /api/health                                            -> {ok:true}
+// Local (brick-and-mortar, James Nov 24, 2026): businesses pay a % on in-person
+// member purchases, verified by the shop's register QR + a receipt photo.
+// Same 70/30 split as online. Claims live in the "local" Blobs store; approval
+// appends a confirmed purchase to the member's purchases snapshot.
 // Loyalty (James's schedule, Nov 22, 2026): daily check-ins build a streak. Day 2 earns +0.1%
 // commission share; each further full week of streak adds +0.1%, capped at +5% (share max 75%).
 // Missing a day resets the streak and the bonus to zero.
@@ -466,6 +478,196 @@ export default async (req) => {
     }));
     await store.set("purchases:" + memberId, JSON.stringify(clean));
     return json({ ok: true, member_id: memberId, count: clean.length }, 200, origin);
+  }
+
+  // ---------------- Local (brick-and-mortar) ----------------
+  const localStore = getStore({ name: "local", consistency: "strong" });
+  const adminKey = (typeof Netlify !== "undefined" && Netlify.env && Netlify.env.get("ADMIN_KEY")) || process.env.ADMIN_KEY || "";
+  const isAdmin = () => {
+    const given = req.headers.get("x-admin-key") || "";
+    return !!adminKey && !!given && given === adminKey;
+  };
+  const money2 = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.round(n * 100) / 100 : NaN; };
+
+  async function loadBusinesses() {
+    const rawBiz = await localStore.get("businesses");
+    if (!rawBiz) return [];
+    try { const parsed = JSON.parse(rawBiz); return Array.isArray(parsed) ? parsed : []; } catch { return []; }
+  }
+  function publicBusiness(b) {
+    return {
+      id: b.id, name: b.name, category: b.category || "", address: b.address || "",
+      lat: b.lat, lng: b.lng, rate_pct: b.rate_pct,
+      member_pct: Math.round(b.rate_pct * 0.7 * 100) / 100, blurb: b.blurb || "",
+    };
+  }
+  async function loadClaims() {
+    const listing = await localStore.list({ prefix: "claim:" });
+    const claims = [];
+    for (const blob of listing.blobs) {
+      const rawClaim = await localStore.get(blob.key);
+      if (!rawClaim) continue;
+      try { claims.push(JSON.parse(rawClaim)); } catch { /* skip corrupt record */ }
+    }
+    claims.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+    return claims;
+  }
+
+  if (path === "/local/businesses" && req.method === "GET") {
+    const businesses = (await loadBusinesses()).filter((b) => b.active !== false).map(publicBusiness);
+    return json({ ok: true, businesses }, 200, origin);
+  }
+
+  if (path === "/local/claim" && req.method === "POST") {
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+
+    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    const businessId = (data.business_id || "").toString().trim().slice(0, 60);
+    const amount = money2(data.amount);
+    const receipt = typeof data.receipt === "string" ? data.receipt : "";
+
+    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    const memberRaw = await store.get("id:" + memberId);
+    if (!memberRaw) return json({ ok: false, error: "invalid_member" }, 404, origin);
+    const member = JSON.parse(memberRaw);
+
+    const business = (await loadBusinesses()).find((b) => b.id === businessId && b.active !== false);
+    if (!business) return json({ ok: false, error: "business_not_found" }, 404, origin);
+    if (!Number.isFinite(amount) || amount < 0.01 || amount > 10000) {
+      return json({ ok: false, error: "invalid_amount" }, 400, origin);
+    }
+    if (!/^data:image\/(jpeg|png|webp);base64,/.test(receipt) || receipt.length > 2000000) {
+      return json({ ok: false, error: "receipt_required" }, 400, origin);
+    }
+
+    // One claim per receipt photo, ever: fingerprint the photo data and refuse
+    // a second live claim carrying the same fingerprint.
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(receipt));
+    const receiptHash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const allClaims = await loadClaims();
+    const dupe = allClaims.find((c) => c.receipt_hash === receiptHash && c.status !== "rejected");
+    if (dupe) return json({ ok: false, error: "receipt_already_claimed" }, 409, origin);
+
+    let claimId = null;
+    for (let i = 0; i < 5 && !claimId; i++) {
+      const candidate = "lc_" + newMemberId().slice(3);
+      if (!(await localStore.get("claim:" + candidate))) claimId = candidate;
+    }
+    if (!claimId) return json({ ok: false, error: "id_failed" }, 500, origin);
+
+    const commission = Math.round(amount * business.rate_pct) / 100;
+    const claim = {
+      id: claimId, member_id: memberId, member_name: member.name || "",
+      business_id: business.id, business_name: business.name,
+      amount, rate_pct: business.rate_pct,
+      commission, member_share: Math.round(commission * 70) / 100,
+      status: "pending", created_at: new Date().toISOString(), receipt_hash: receiptHash,
+    };
+    await localStore.set("receipt:" + claimId, receipt);
+    await localStore.set("claim:" + claimId, JSON.stringify(claim));
+    return json({ ok: true, claim }, 201, origin);
+  }
+
+  if (path === "/local/claims" && req.method === "GET") {
+    const memberId = (url.searchParams.get("id") || "").trim();
+    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
+    const claims = (await loadClaims())
+      .filter((c) => c.member_id === memberId)
+      .map((c) => ({
+        id: c.id, business_name: c.business_name, amount: c.amount, rate_pct: c.rate_pct,
+        member_share: c.member_share, status: c.status, created_at: c.created_at,
+      }));
+    const totals = { pending: 0, approved: 0 };
+    for (const c of claims) {
+      if (c.status === "pending") totals.pending = Math.round((totals.pending + c.member_share) * 100) / 100;
+      if (c.status === "approved") totals.approved = Math.round((totals.approved + c.member_share) * 100) / 100;
+    }
+    return json({ ok: true, member_id: memberId, claims, totals }, 200, origin);
+  }
+
+  if (path === "/admin/local-businesses" && req.method === "GET") {
+    if (!isAdmin()) return json({ ok: false, error: "unauthorized" }, 401, origin);
+    return json({ ok: true, businesses: await loadBusinesses() }, 200, origin);
+  }
+
+  if (path === "/admin/local-businesses" && req.method === "POST") {
+    if (!isAdmin()) return json({ ok: false, error: "unauthorized" }, 401, origin);
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    if (!Array.isArray(data.businesses) || data.businesses.length > 200) {
+      return json({ ok: false, error: "invalid_businesses" }, 400, origin);
+    }
+    const clean = [];
+    for (const b of data.businesses) {
+      const id = (b && b.id ? String(b.id) : "").trim().slice(0, 60);
+      const name = (b && b.name ? String(b.name) : "").trim().slice(0, 120);
+      const lat = Number(b && b.lat), lng = Number(b && b.lng), rate = Number(b && b.rate_pct);
+      if (!/^lb_[a-z0-9][a-z0-9-]{1,50}$/.test(id) || !name) return json({ ok: false, error: "invalid_business" }, 400, origin);
+      if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lng) || lng < -180 || lng > 180) {
+        return json({ ok: false, error: "invalid_business" }, 400, origin);
+      }
+      if (!Number.isFinite(rate) || rate <= 0 || rate > 50) return json({ ok: false, error: "invalid_business" }, 400, origin);
+      clean.push({
+        id, name, category: String(b.category || "").slice(0, 60), address: String(b.address || "").slice(0, 200),
+        lat, lng, rate_pct: Math.round(rate * 100) / 100, blurb: String(b.blurb || "").slice(0, 300),
+        active: b.active !== false,
+      });
+    }
+    await localStore.set("businesses", JSON.stringify(clean));
+    return json({ ok: true, count: clean.length }, 200, origin);
+  }
+
+  if (path === "/admin/local-claims" && req.method === "GET") {
+    if (!isAdmin()) return json({ ok: false, error: "unauthorized" }, 401, origin);
+    const claims = await loadClaims();
+    return json({ ok: true, count: claims.length, claims }, 200, origin);
+  }
+
+  if (path === "/admin/local-receipt" && req.method === "GET") {
+    if (!isAdmin()) return json({ ok: false, error: "unauthorized" }, 401, origin);
+    const claimId = (url.searchParams.get("id") || "").trim();
+    if (!/^lc_[A-Za-z0-9]{10}$/.test(claimId)) return json({ ok: false, error: "invalid_claim" }, 400, origin);
+    const receipt = await localStore.get("receipt:" + claimId);
+    if (!receipt) return json({ ok: false, error: "not_found" }, 404, origin);
+    return json({ ok: true, claim_id: claimId, receipt }, 200, origin);
+  }
+
+  if (path === "/admin/local-claim-decide" && req.method === "POST") {
+    if (!isAdmin()) return json({ ok: false, error: "unauthorized" }, 401, origin);
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    const claimId = (data.claim_id || "").toString().trim().slice(0, 40);
+    const decision = data.decision === "approve" ? "approved" : data.decision === "reject" ? "rejected" : null;
+    if (!/^lc_[A-Za-z0-9]{10}$/.test(claimId) || !decision) return json({ ok: false, error: "invalid_claim" }, 400, origin);
+    const claimRaw = await localStore.get("claim:" + claimId);
+    if (!claimRaw) return json({ ok: false, error: "not_found" }, 404, origin);
+    const claim = JSON.parse(claimRaw);
+    if (claim.status !== "pending") return json({ ok: true, claim, already_decided: true }, 200, origin);
+    claim.status = decision;
+    claim.decided_at = new Date().toISOString();
+    await localStore.set("claim:" + claimId, JSON.stringify(claim));
+
+    if (decision === "approved") {
+      // Credit the member: append a confirmed purchase to their snapshot.
+      // If the business never pays, reverse it through /admin/purchases —
+      // the standard clawback path.
+      let purchases = [];
+      const pRaw = await store.get("purchases:" + claim.member_id);
+      if (pRaw) { try { const parsed = JSON.parse(pRaw); if (Array.isArray(parsed)) purchases = parsed; } catch { purchases = []; } }
+      if (!purchases.some((p) => p.id === claim.id)) {
+        const day = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Chicago" }).format(new Date(claim.created_at));
+        purchases.push({
+          id: claim.id, store: claim.business_name + " (Local)", date: day,
+          sale_amount: claim.amount, commission: claim.commission,
+          member_share: claim.member_share, status: "confirmed",
+        });
+        await store.set("purchases:" + claim.member_id, JSON.stringify(purchases));
+      }
+    }
+    return json({ ok: true, claim }, 200, origin);
   }
 
   return json({ ok: false, error: "route_not_found" }, 404, origin);
