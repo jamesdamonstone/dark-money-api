@@ -998,15 +998,16 @@ export default async (req) => {
     }
     const money = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) / 100 : 0; };
     const clean = data.purchases.map((p, i) => {
-      const sale = money(p && p.sale_amount);
+      const commission = money(p && p.commission);
       return {
         id: (p && p.id ? String(p.id) : "purchase_" + (i + 1)).slice(0, 80),
         store: (p && p.store ? String(p.store) : "Store").slice(0, 120),
         date: validDay(p && p.date) ? p.date : null,
-        sale_amount: sale,
-        commission: money(p && p.commission),
-        // Hard cap (James, Nov 24, 2026): no purchase can exceed 100% back.
-        member_share: Math.min(money(p && p.member_share), sale),
+        sale_amount: money(p && p.sale_amount),
+        commission,
+        // Hard cap (James, Nov 24, 2026): a member's share on a purchase can
+        // never exceed 100% of that purchase's commission (the cashback).
+        member_share: Math.min(money(p && p.member_share), commission),
         status: ["pending", "confirmed", "paid", "reversed"].includes(p && p.status) ? p.status : "pending",
       };
     });
@@ -1140,9 +1141,9 @@ export default async (req) => {
       id: claimId, member_id: memberId, member_name: member.name || "",
       business_id: business.id, business_name: business.name,
       amount, rate_pct: business.rate_pct,
-      // Hard cap (James, Nov 24, 2026): no purchase can exceed 100% back —
-      // a member's share on a purchase never exceeds the purchase amount.
-      commission, member_share: Math.min(Math.round(commission * 70) / 100, amount),
+      // Hard cap (James, Nov 24, 2026): a member's share on a purchase can
+      // never exceed 100% of that purchase's commission (the cashback).
+      commission, member_share: Math.min(Math.round(commission * 70) / 100, commission),
       status: "pending", created_at: new Date().toISOString(), receipt_hash: receiptHash,
     };
     await localStore.set("receipt:" + claimId, receipt);
