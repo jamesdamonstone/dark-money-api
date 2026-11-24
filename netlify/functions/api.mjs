@@ -659,12 +659,57 @@ export default async (req) => {
     return claims;
   }
 
+  // Receipt photos are the privacy-sensitive part of a claim, so they are
+  // only kept for 30 days after the claim is decided. The claim record
+  // itself (amounts, status, receipt_hash) is kept forever — it is the
+  // audit trail, and the hash is what blocks duplicate claims.
+  const RECEIPT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+  function receiptDeleteAfterMs(claim) {
+    // When this decided claim's receipt photo becomes eligible for deletion.
+    if (claim.receipt_delete_after) {
+      const t = Date.parse(claim.receipt_delete_after);
+      if (Number.isFinite(t)) return t;
+    }
+    // Claims decided before the retention stamp existed: decision + 30 days,
+    // falling back to creation + 30 days when no decision time was recorded.
+    const basis = claim.decided_at || claim.created_at;
+    const t = basis ? Date.parse(basis) : NaN;
+    return Number.isFinite(t) ? t + RECEIPT_RETENTION_MS : NaN;
+  }
+  async function sweepOldReceipts(store) {
+    // Lazy retention sweep: delete receipt blobs for decided claims past
+    // their 30-day window and mark the claim receipt_deleted. Pending
+    // claims are never touched. Fully error-swallowing — a sweep failure
+    // must never break the request that triggered it.
+    try {
+      const now = Date.now();
+      const listing = await store.list({ prefix: "claim:" });
+      for (const blob of listing.blobs) {
+        try {
+          const rawClaim = await store.get(blob.key);
+          if (!rawClaim) continue;
+          let claim;
+          try { claim = JSON.parse(rawClaim); } catch { continue; }
+          if (!claim || claim.status === "pending" || claim.receipt_deleted) continue;
+          const due = receiptDeleteAfterMs(claim);
+          if (!Number.isFinite(due) || now < due) continue;
+          const id = claim.id || blob.key.slice("claim:".length);
+          await store.delete("receipt:" + id);
+          claim.receipt_deleted = true;
+          if (!claim.receipt_delete_after) claim.receipt_delete_after = new Date(due).toISOString();
+          await store.set(blob.key, JSON.stringify(claim));
+        } catch { /* skip this claim; never break the sweep */ }
+      }
+    } catch { /* sweep is best-effort only */ }
+  }
+
   if (path === "/local/businesses" && req.method === "GET") {
     const businesses = (await loadBusinesses()).filter((b) => b.active !== false).map(publicBusiness);
     return json({ ok: true, businesses }, 200, origin);
   }
 
   if (path === "/local/claim" && req.method === "POST") {
+    await sweepOldReceipts(localStore);
     let data;
     try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
 
@@ -768,6 +813,7 @@ export default async (req) => {
 
   if (path === "/admin/local-claims" && req.method === "GET") {
     if (!isAdmin()) return json({ ok: false, error: "unauthorized" }, 401, origin);
+    await sweepOldReceipts(localStore);
     const claims = await loadClaims();
     return json({ ok: true, count: claims.length, claims }, 200, origin);
   }
@@ -793,7 +839,9 @@ export default async (req) => {
     const claim = JSON.parse(claimRaw);
     if (claim.status !== "pending") return json({ ok: true, claim, already_decided: true }, 200, origin);
     claim.status = decision;
-    claim.decided_at = new Date().toISOString();
+    if (!claim.decided_at) claim.decided_at = new Date().toISOString();
+    // The receipt photo is deleted 30 days after the decision (lazy sweep).
+    claim.receipt_delete_after = new Date(new Date(claim.decided_at).getTime() + RECEIPT_RETENTION_MS).toISOString();
     await localStore.set("claim:" + claimId, JSON.stringify(claim));
 
     if (decision === "approved") {
