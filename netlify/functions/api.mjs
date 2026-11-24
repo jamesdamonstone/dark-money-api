@@ -35,6 +35,9 @@
 // Loyalty (James's schedule, Nov 22, 2026): daily check-ins build a streak. Day 2 earns +0.1%
 // commission share; each further full week of streak adds +0.1%, capped at +5% (share max 75%).
 // Missing a day resets the streak and the bonus to zero.
+// Referral bonus (James, Nov 24, 2026): every 20 referred members who have completed a
+// confirmed purchase adds a permanent +0.1% share, capped at +5%. It never resets, and
+// signups without a confirmed purchase do not count. Stacks with the streak bonus.
 // Referrals (Nov 23, 2026): join accepts an optional `ref` — originally the referring
 // member's ID. It is validated against the registry and stored on the new record as
 // `referred_by`. (Nov 24, 2026): every member now also has a public referral code
@@ -371,18 +374,84 @@ function loyaltyBonus(streak) {
   return Math.round(Math.min(5, b) * 10) / 10;
 }
 
-function loyaltyView(rec, todayStr) {
-  if (!rec) return { streak: 0, bonus_pct: 0, share_pct: 70, last_date: null, total_checkins: 0, lapsed: false };
+function loyaltyDates(rec) {
+  if (Array.isArray(rec.dates) && rec.dates.length) return rec.dates;
+  // Legacy records predate per-day history: reconstruct the live streak's days.
+  const out = [];
+  if (rec.last_date && rec.streak > 0) {
+    for (let i = rec.streak - 1; i >= 0; i--) out.push(shiftDay(rec.last_date, -i));
+  }
+  return out;
+}
+
+function referralBonus(qualifiedCount) {
+  const tiers = Math.floor((qualifiedCount || 0) / 20);
+  return Math.round(Math.min(5, tiers * 0.1) * 10) / 10;
+}
+
+// Count a member's referred members, and how many of them have completed a
+// confirmed purchase (at least one purchase in confirmed or paid status).
+async function qualifiedReferralCount(store, memberId) {
+  const listing = await store.list({ prefix: "id:" });
+  const referredIds = [];
+  for (const blob of listing.blobs) {
+    const raw = await store.get(blob.key);
+    if (!raw) continue;
+    try {
+      const m = JSON.parse(raw);
+      if (m.referred_by === memberId) referredIds.push(m.member_id);
+    } catch { /* skip corrupt record */ }
+  }
+  let qualified = 0;
+  for (const rid of referredIds) {
+    const pRaw = await store.get("purchases:" + rid);
+    if (!pRaw) continue;
+    try {
+      const purchases = JSON.parse(pRaw);
+      if (Array.isArray(purchases) && purchases.some((p) => p.status === "confirmed" || p.status === "paid")) qualified++;
+    } catch { /* skip corrupt record */ }
+  }
+  return { qualified, total: referredIds.length };
+}
+
+function loyaltyView(rec, todayStr, qualifiedReferrals, totalReferrals) {
+  const refBonus = referralBonus(qualifiedReferrals);
+  const refFields = {
+    referral_bonus_pct: refBonus,
+    referral_count: qualifiedReferrals || 0,
+    referrals_total: totalReferrals || 0,
+  };
+  if (!rec) {
+    const empty_days = [];
+    if (todayStr) {
+      for (let i = 13; i >= 0; i--) {
+        const d = shiftDay(todayStr, -i);
+        empty_days.push({ date: d, checked: false, today: d === todayStr });
+      }
+    }
+    return { streak: 0, streak_bonus_pct: 0, bonus_pct: refBonus, share_pct: Math.round((70 + refBonus) * 10) / 10, last_date: null, total_checkins: 0, lapsed: false, checked_today: false, recent_days: empty_days, ...refFields };
+  }
   let streak = rec.streak || 0;
   let lapsed = false;
   if (todayStr && rec.last_date && rec.last_date < shiftDay(todayStr, -1)) {
     streak = 0;
     lapsed = true;
   }
-  const bonus = loyaltyBonus(streak);
+  const streakBonus = loyaltyBonus(streak);
+  const bonus = Math.round((streakBonus + refBonus) * 10) / 10;
+  let recent_days = [];
+  if (todayStr) {
+    const set = new Set(loyaltyDates(rec));
+    for (let i = 13; i >= 0; i--) {
+      const d = shiftDay(todayStr, -i);
+      recent_days.push({ date: d, checked: set.has(d), today: d === todayStr });
+    }
+  }
   return {
-    streak, bonus_pct: bonus, share_pct: Math.round((70 + bonus) * 10) / 10,
+    streak, streak_bonus_pct: streakBonus, bonus_pct: bonus, share_pct: Math.round((70 + bonus) * 10) / 10,
     last_date: rec.last_date || null, total_checkins: rec.total_checkins || 0, lapsed,
+    checked_today: !!todayStr && rec.last_date === todayStr,
+    recent_days, ...refFields,
   };
 }
 
@@ -694,7 +763,7 @@ export default async (req) => {
       let rec = null;
       const recRaw = await store.get("loyalty:" + m.member_id);
       if (recRaw) { try { rec = JSON.parse(recRaw); } catch { rec = null; } }
-      m.loyalty = loyaltyView(rec, null);
+      m._loyalty_rec = rec;
     }
     // Referral counts in a single pass over the loaded records (referred_by is
     // already on each record; first names only, matching the member payloads).
@@ -702,12 +771,29 @@ export default async (req) => {
     for (const m of members) {
       if (m.referred_by) (byReferrer[m.referred_by] = byReferrer[m.referred_by] || []).push(m);
     }
+    // Members holding at least one confirmed/paid purchase, in a single pass
+    // over the purchase snapshots — the referral bonus counts only those.
+    const confirmedBuyers = new Set();
+    const pListing = await store.list({ prefix: "purchases:" });
+    for (const blob of pListing.blobs) {
+      const pRaw = await store.get(blob.key);
+      if (!pRaw) continue;
+      try {
+        const purchases = JSON.parse(pRaw);
+        if (Array.isArray(purchases) && purchases.some((p) => p.status === "confirmed" || p.status === "paid")) {
+          confirmedBuyers.add(blob.key.slice("purchases:".length));
+        }
+      } catch { /* skip corrupt record */ }
+    }
     for (const m of members) {
       const list = byReferrer[m.member_id] || [];
       m.referral_count = list.length;
       m.referrals = list.map((r) => ({
         name: (r.name || "").trim().split(/\s+/)[0] || "", joined_at: r.joined_at || null,
       }));
+      const qualified = list.filter((r) => confirmedBuyers.has(r.member_id)).length;
+      m.loyalty = loyaltyView(m._loyalty_rec, null, qualified, list.length);
+      delete m._loyalty_rec;
     }
     return json({ ok: true, count: members.length, totals, members }, 200, origin);
   }
@@ -841,6 +927,7 @@ export default async (req) => {
 
     let already = false;
     if (rec.last_date === date) {
+      // One check-in per day: a repeat POST the same day changes nothing.
       already = true;
     } else if (rec.last_date === shiftDay(date, -1)) {
       rec.streak = (rec.streak || 0) + 1;
@@ -852,8 +939,17 @@ export default async (req) => {
       rec.last_date = date;
       rec.total_checkins = (rec.total_checkins || 0) + 1;
     }
+    if (!already) {
+      if (!Array.isArray(rec.dates)) rec.dates = loyaltyDates(rec);
+      if (!rec.dates.includes(date)) {
+        rec.dates.push(date);
+        rec.dates.sort();
+        if (rec.dates.length > 90) rec.dates = rec.dates.slice(-90);
+      }
+    }
     await store.set("loyalty:" + memberId, JSON.stringify(rec));
-    const view = loyaltyView(rec, date);
+    const rq = await qualifiedReferralCount(store, memberId);
+    const view = loyaltyView(rec, date, rq.qualified, rq.total);
     return json({ ok: true, already_checked_in: already, ...view }, 200, origin);
   }
 
@@ -866,7 +962,8 @@ export default async (req) => {
     let rec = null;
     const recRaw = await store.get("loyalty:" + memberId);
     if (recRaw) { try { rec = JSON.parse(recRaw); } catch { rec = null; } }
-    return json({ ok: true, member_id: memberId, ...loyaltyView(rec, validDay(date) ? date : null) }, 200, origin);
+    const rq = await qualifiedReferralCount(store, memberId);
+    return json({ ok: true, member_id: memberId, ...loyaltyView(rec, validDay(date) ? date : null, rq.qualified, rq.total) }, 200, origin);
   }
 
   if (path === "/purchases" && req.method === "GET") {
@@ -900,15 +997,19 @@ export default async (req) => {
       return json({ ok: false, error: "invalid_purchases" }, 400, origin);
     }
     const money = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) / 100 : 0; };
-    const clean = data.purchases.map((p, i) => ({
-      id: (p && p.id ? String(p.id) : "purchase_" + (i + 1)).slice(0, 80),
-      store: (p && p.store ? String(p.store) : "Store").slice(0, 120),
-      date: validDay(p && p.date) ? p.date : null,
-      sale_amount: money(p && p.sale_amount),
-      commission: money(p && p.commission),
-      member_share: money(p && p.member_share),
-      status: ["pending", "confirmed", "paid", "reversed"].includes(p && p.status) ? p.status : "pending",
-    }));
+    const clean = data.purchases.map((p, i) => {
+      const sale = money(p && p.sale_amount);
+      return {
+        id: (p && p.id ? String(p.id) : "purchase_" + (i + 1)).slice(0, 80),
+        store: (p && p.store ? String(p.store) : "Store").slice(0, 120),
+        date: validDay(p && p.date) ? p.date : null,
+        sale_amount: sale,
+        commission: money(p && p.commission),
+        // Hard cap (James, Nov 24, 2026): no purchase can exceed 100% back.
+        member_share: Math.min(money(p && p.member_share), sale),
+        status: ["pending", "confirmed", "paid", "reversed"].includes(p && p.status) ? p.status : "pending",
+      };
+    });
     await store.set("purchases:" + memberId, JSON.stringify(clean));
     return json({ ok: true, member_id: memberId, count: clean.length }, 200, origin);
   }
@@ -1039,7 +1140,9 @@ export default async (req) => {
       id: claimId, member_id: memberId, member_name: member.name || "",
       business_id: business.id, business_name: business.name,
       amount, rate_pct: business.rate_pct,
-      commission, member_share: Math.round(commission * 70) / 100,
+      // Hard cap (James, Nov 24, 2026): no purchase can exceed 100% back —
+      // a member's share on a purchase never exceeds the purchase amount.
+      commission, member_share: Math.min(Math.round(commission * 70) / 100, amount),
       status: "pending", created_at: new Date().toISOString(), receipt_hash: receiptHash,
     };
     await localStore.set("receipt:" + claimId, receipt);
