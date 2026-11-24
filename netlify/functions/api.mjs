@@ -309,6 +309,38 @@ async function bumpTsList(secStore, key, windowMs) {
   } catch { /* never break the request */ }
 }
 
+// Security event log: a capped rolling list in the "security" store,
+// appended wherever a throttle or guard fires — failed logins, login/join
+// throttle trips, failed admin keys, admin-guard trips. Read back through
+// GET /admin/security-events so the owner's heartbeat watch can spot
+// attack patterns (the throttles alone are silent). Every helper swallows
+// store errors: logging must never break a request.
+const SEC_EVENT_KEY = "events";
+const SEC_EVENT_CAP = 500;
+
+async function logSecurityEvent(secStore, type, detail) {
+  try {
+    const raw = await secStore.get(SEC_EVENT_KEY);
+    let list = [];
+    if (raw) {
+      try { const p = JSON.parse(raw); if (Array.isArray(p)) list = p; } catch { /* start fresh */ }
+    }
+    list.push({ ts: Date.now(), type, ...(detail || {}) });
+    if (list.length > SEC_EVENT_CAP) list = list.slice(list.length - SEC_EVENT_CAP);
+    await secStore.set(SEC_EVENT_KEY, JSON.stringify(list));
+  } catch { /* never break the request */ }
+}
+
+async function loadSecurityEvents(secStore, sinceMs) {
+  try {
+    const raw = await secStore.get(SEC_EVENT_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return sinceMs ? parsed.filter((e) => e && typeof e.ts === "number" && e.ts >= sinceMs) : parsed;
+  } catch { return []; }
+}
+
 async function joinThrottled(secStore, ip) {
   try {
     const list = await loadTsList(secStore, "join:ip:" + ip, JOIN_WINDOW_MS);
@@ -372,12 +404,14 @@ export default async (req) => {
   if (path.startsWith("/admin/")) {
     const gateIp = clientIp(req);
     if (await adminThrottled(secStore, gateIp)) {
+      await logSecurityEvent(secStore, "admin_throttled", { ip: gateIp });
       return json({ ok: false, error: "too_many_attempts" }, 429, origin);
     }
     const gateKey = (typeof Netlify !== "undefined" && Netlify.env && Netlify.env.get("ADMIN_KEY")) || process.env.ADMIN_KEY || "";
     const gateGiven = req.headers.get("x-admin-key") || "";
     if (!gateKey || !gateGiven || gateGiven !== gateKey) {
       await bumpTsList(secStore, "adminfail:ip:" + gateIp, ADMIN_WINDOW_MS);
+      await logSecurityEvent(secStore, "admin_key_fail", { ip: gateIp });
       return json({ ok: false, error: "unauthorized" }, 401, origin);
     }
   }
@@ -390,6 +424,7 @@ export default async (req) => {
     // pattern, not a signup rush. Every attempt counts toward the limit.
     const joinIp = clientIp(req);
     if (await joinThrottled(secStore, joinIp)) {
+      await logSecurityEvent(secStore, "join_throttled", { ip: joinIp });
       return json({ ok: false, error: "too_many_attempts" }, 429, origin);
     }
     await bumpTsList(secStore, "join:ip:" + joinIp, JOIN_WINDOW_MS);
@@ -479,10 +514,12 @@ export default async (req) => {
     const secStore = getStore({ name: "security", consistency: "strong" });
     const ip = clientIp(req);
     if (await loginThrottled(secStore, email, ip)) {
+      await logSecurityEvent(secStore, "login_throttled", { ip, email });
       return json({ ok: false, error: "too_many_attempts" }, 429, origin);
     }
     const fail = async (error, status) => {
       await recordLoginFailure(secStore, email, ip);
+      await logSecurityEvent(secStore, "login_fail", { ip, email });
       return json({ ok: false, error }, status, origin);
     };
 
@@ -591,6 +628,30 @@ export default async (req) => {
     await store.set("id:" + memberId, JSON.stringify(m));
     await store.delete("vtoken:" + token);
     return page(200, "Email verified — you're all set", "Thanks — your email address is confirmed for your Dark Money membership. You can head back to the app.");
+  }
+
+  if (path === "/admin/security-events" && req.method === "GET") {
+    // The security event log (see logSecurityEvent): recent throttle/guard
+    // events plus per-type counts for the last hour and last 24 hours, so
+    // the owner's watch can spot attack patterns at a glance. ?hours=N
+    // (default 24, max 168) controls how far back the event list reaches.
+    let hours = Number(url.searchParams.get("hours") || 24);
+    if (!Number.isFinite(hours) || hours <= 0) hours = 24;
+    if (hours > 168) hours = 168;
+    const now = Date.now();
+    const events = await loadSecurityEvents(secStore, now - hours * 3600 * 1000);
+    const tally = (list) => {
+      const counts = {};
+      for (const e of list) counts[e.type] = (counts[e.type] || 0) + 1;
+      return counts;
+    };
+    return json({
+      ok: true,
+      hours,
+      counts_1h: tally(events.filter((e) => e.ts >= now - 3600 * 1000)),
+      counts_24h: tally(events.filter((e) => e.ts >= now - 24 * 3600 * 1000)),
+      events,
+    }, 200, origin);
   }
 
   if (path === "/admin/members" && req.method === "GET") {
