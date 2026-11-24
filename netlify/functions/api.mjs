@@ -1,11 +1,17 @@
 // Dark Money — join + member registry API (Netlify Function + Netlify Blobs)
 // Store: Blobs store "members". Routes (via /api/* redirect):
 //   POST /api/join          {name, email, style, payout, terms, ref?, password?} -> {ok, member_id, app_url}
+//                           (an already-registered email gets 409 {error:"email_taken"} — never the existing ID;
+//                           joins are throttled per IP; new members start email_verified:false with a verify_token)
 //   POST /api/login         {email, member_id} or {email, password} -> {ok, member} (email + ID must match, or the member's password;
 //                           ID login is refused with "password_required" once the member has a password; failed logins are throttled)
 //   POST /api/set-password  {member_id, password}               -> {ok} (sets/replaces the member's login password; the member ID is the credential, same as every member route)
-//   GET  /api/member?id=dm_xxx | ?email=a@b.c                   -> {ok, member} (public fields only)
-//   GET  /api/admin/members  header x-admin-key: $ADMIN_KEY     -> {ok, count, members, totals}
+//   GET  /api/member?id=dm_xxx                                  -> {ok, member} (public fields only)
+//   GET  /api/member?email=a@b.c                                -> {ok, existing} (existence ONLY — no name, no ID; audit P0-1)
+//   GET  /api/verify?token=<verify_token>                       -> HTML page (marks the member's email verified; token is single-use)
+//   GET  /api/admin/members  header x-admin-key: $ADMIN_KEY     -> {ok, count, members, totals} (unverified members carry verify_token + verify_url)
+//   POST /api/admin/payout-code {member_id}  header x-admin-key -> {ok, code, expires} (6-digit payout identity code, 48h; audit P0-3)
+//   POST /api/admin/payout-code-clear {member_id} header x-admin-key -> {ok} (clears the payout code after a payout completes)
 //   POST /api/payout-request {member_id}                        -> {ok, requested_at} (queues a payout request; no money moves)
 //   GET  /api/admin/payout-requests  header x-admin-key         -> {ok, count, requests}
 //   POST /api/admin/payout-sent {member_id}  header x-admin-key -> {ok} (marks a request sent, clearing the queue entry)
@@ -128,7 +134,36 @@ function validEmail(e) {
 }
 
 function publicMember(m) {
-  return { member_id: m.member_id, name: m.name, joined_at: m.joined_at, style: m.style, has_password: !!m.pw, ref_code: m.ref_code || null };
+  return { member_id: m.member_id, name: m.name, joined_at: m.joined_at, style: m.style, has_password: !!m.pw, ref_code: m.ref_code || null, email_verified: !!m.email_verified };
+}
+
+// Email verification tokens: 24 chars from the same unambiguous alphabet,
+// indexed under "vtoken:" -> member_id (same pattern as the refcode index).
+// Joining stays instant — the token only marks the address as confirmed
+// when its link is clicked; the API sends no mail itself, so the verify
+// URL reaches the member through the owner (admin payload carries it).
+function newVerifyToken() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  let token = "";
+  for (const b of bytes) token += ALPHABET[b % ALPHABET.length];
+  return token;
+}
+
+// Return the member's verify token, minting + indexing + persisting one if
+// needed. Verified members (and token-less lookups that fail) return null.
+async function ensureVerifyToken(store, m) {
+  if (!m || !m.member_id || m.email_verified) return null;
+  if (typeof m.verify_token === "string" && m.verify_token.length >= 24) return m.verify_token;
+  for (let i = 0; i < 5; i++) {
+    const candidate = newVerifyToken();
+    if (await store.get("vtoken:" + candidate)) continue;
+    m.verify_token = candidate;
+    await store.set("id:" + m.member_id, JSON.stringify(m));
+    await store.set("vtoken:" + candidate, m.member_id);
+    return candidate;
+  }
+  return null;
 }
 
 // Referral view for one member: everyone whose record points back at them.
@@ -246,6 +281,48 @@ async function clearLoginFailures(secStore, email) {
   try { await secStore.delete("loginfail:email:" + email); } catch { /* never break login */ }
 }
 
+// Generic timestamp-list counters in the "security" store — the same
+// pattern as the login throttle, with a caller-chosen window. Used for the
+// per-IP join throttle and the failed-admin-key guard. Every helper
+// swallows store errors: a counter failure must never break a request.
+const JOIN_WINDOW_MS = 60 * 60 * 1000;
+const JOIN_IP_LIMIT = 10;
+const ADMIN_WINDOW_MS = 15 * 60 * 1000;
+const ADMIN_IP_LIMIT = 20;
+
+async function loadTsList(secStore, key, windowMs) {
+  try {
+    const raw = await secStore.get(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const cutoff = Date.now() - windowMs;
+    return parsed.filter((t) => typeof t === "number" && t > cutoff);
+  } catch { return []; }
+}
+
+async function bumpTsList(secStore, key, windowMs) {
+  try {
+    const list = await loadTsList(secStore, key, windowMs);
+    list.push(Date.now());
+    await secStore.set(key, JSON.stringify(list));
+  } catch { /* never break the request */ }
+}
+
+async function joinThrottled(secStore, ip) {
+  try {
+    const list = await loadTsList(secStore, "join:ip:" + ip, JOIN_WINDOW_MS);
+    return list.length >= JOIN_IP_LIMIT;
+  } catch { return false; }
+}
+
+async function adminThrottled(secStore, ip) {
+  try {
+    const list = await loadTsList(secStore, "adminfail:ip:" + ip, ADMIN_WINDOW_MS);
+    return list.length > ADMIN_IP_LIMIT;
+  } catch { return false; }
+}
+
 function validDay(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s + "T00:00:00Z"));
 }
@@ -286,10 +363,36 @@ export default async (req) => {
   if (path === "/health") return json({ ok: true, service: "dark-money-join" }, 200, origin);
 
   const store = getStore({ name: "members", consistency: "strong" });
+  const secStore = getStore({ name: "security", consistency: "strong" });
+
+  // Admin gate, centralized: every /admin/* route needs the admin key.
+  // Failed key attempts are counted per IP in the security store; past 20
+  // failures inside 15 minutes the IP gets 429s on admin routes until the
+  // window passes. The per-route key checks below stay as a backstop.
+  if (path.startsWith("/admin/")) {
+    const gateIp = clientIp(req);
+    if (await adminThrottled(secStore, gateIp)) {
+      return json({ ok: false, error: "too_many_attempts" }, 429, origin);
+    }
+    const gateKey = (typeof Netlify !== "undefined" && Netlify.env && Netlify.env.get("ADMIN_KEY")) || process.env.ADMIN_KEY || "";
+    const gateGiven = req.headers.get("x-admin-key") || "";
+    if (!gateKey || !gateGiven || gateGiven !== gateKey) {
+      await bumpTsList(secStore, "adminfail:ip:" + gateIp, ADMIN_WINDOW_MS);
+      return json({ ok: false, error: "unauthorized" }, 401, origin);
+    }
+  }
 
   if (path === "/join" && req.method === "POST") {
     let data;
     try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+
+    // Join throttle: more than 10 joins from one IP in an hour is a bot
+    // pattern, not a signup rush. Every attempt counts toward the limit.
+    const joinIp = clientIp(req);
+    if (await joinThrottled(secStore, joinIp)) {
+      return json({ ok: false, error: "too_many_attempts" }, 429, origin);
+    }
+    await bumpTsList(secStore, "join:ip:" + joinIp, JOIN_WINDOW_MS);
 
     const name = (data.name || "").toString().trim().slice(0, 120);
     const email = (data.email || "").toString().trim().toLowerCase().slice(0, 254);
@@ -307,7 +410,11 @@ export default async (req) => {
 
     const existing = await store.get("email:" + email);
     if (existing) {
-      return json({ ok: true, member_id: existing, existing: true, app_url: APP_BASE + "#" + existing }, 200, origin);
+      // Never hand the existing member's ID back to whoever posted the
+      // email — with the ID doubling as a login credential, echoing it
+      // was an account-takeover path (audit P0-2). The caller just learns
+      // the email is taken; recovery happens out-of-band with the owner.
+      return json({ ok: false, error: "email_taken" }, 409, origin);
     }
 
     let memberId = null;
@@ -333,9 +440,20 @@ export default async (req) => {
       if (!(await store.get("refcode:" + candidate))) refCode = candidate;
     }
 
+    // Email verification starts unverified with a single-use token. Joining
+    // is still instant — nothing waits on the click; the token just lets
+    // the member prove the address is theirs whenever they use the link.
+    let verifyToken = null;
+    for (let i = 0; i < 5 && !verifyToken; i++) {
+      const candidate = newVerifyToken();
+      if (!(await store.get("vtoken:" + candidate))) verifyToken = candidate;
+    }
+
     const member = {
       member_id: memberId, name, email, style, payout,
       terms_agreed: true, joined_at: new Date().toISOString(), source: "website",
+      email_verified: false,
+      ...(verifyToken ? { verify_token: verifyToken } : {}),
       ...(refCode ? { ref_code: refCode } : {}),
       ...(referredBy ? { referred_by: referredBy } : {}),
       ...(joinPassword ? { pw: await makePasswordRecord(joinPassword) } : {}),
@@ -343,6 +461,7 @@ export default async (req) => {
     await store.set("id:" + memberId, JSON.stringify(member));
     await store.set("email:" + email, memberId);
     if (refCode) await store.set("refcode:" + refCode, memberId);
+    if (verifyToken) await store.set("vtoken:" + verifyToken, memberId);
 
     return json({ ok: true, member_id: memberId, existing: false, app_url: APP_BASE + "#" + memberId }, 201, origin);
   }
@@ -414,15 +533,64 @@ export default async (req) => {
   }
 
   if (path === "/member" && req.method === "GET") {
-    let memberId = url.searchParams.get("id");
-    const email = (url.searchParams.get("email") || "").trim().toLowerCase();
-    if (!memberId && email) memberId = await store.get("email:" + email);
+    const memberId = url.searchParams.get("id");
+    // The ?email= form is an existence check ONLY (audit P0-1): it used to
+    // resolve an email to the member's name + ID with no auth, and the ID
+    // is a login credential — an identity oracle. It now answers just
+    // whether the address is registered, nothing else.
+    if (!memberId && url.searchParams.get("email") !== null) {
+      const email = (url.searchParams.get("email") || "").trim().toLowerCase();
+      const found = email ? await store.get("email:" + email) : null;
+      return json({ ok: true, existing: !!found }, 200, origin);
+    }
     if (!memberId) return json({ ok: false, error: "not_found" }, 404, origin);
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
     const m = JSON.parse(raw);
     await ensureRefCode(store, m);
     return json({ ok: true, member: { ...publicMember(m), ...(await referralInfo(store, m.member_id)) } }, 200, origin);
+  }
+
+  if (path === "/verify" && req.method === "GET") {
+    const page = (status, title, message) => new Response(
+      "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
+      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+      "<title>" + title + " — Dark Money</title></head>" +
+      "<body style=\"margin:0;font-family:system-ui,-apple-system,sans-serif;background:#0e1420;color:#e8edf5\">" +
+      "<main style=\"max-width:430px;margin:12vh auto 0;padding:28px 24px;text-align:center\">" +
+      "<h1 style=\"font-size:1.5rem;margin:0 0 12px\">" + title + "</h1>" +
+      "<p style=\"color:#aeb9c9;line-height:1.55;margin:0 0 22px\">" + message + "</p>" +
+      "<a href=\"" + APP_BASE + "\" style=\"display:inline-block;padding:12px 22px;border-radius:10px;background:#c9a227;color:#14100a;font-weight:700;text-decoration:none\">Open Dark Money</a>" +
+      "</main></body></html>",
+      { status, headers: { "Content-Type": "text/html; charset=utf-8", ...cors(origin) } }
+    );
+    const token = (url.searchParams.get("token") || "").trim();
+    let memberId = token ? await store.get("vtoken:" + token) : null;
+    if (!memberId && token) {
+      // Fall back to a scan in case an index entry is missing.
+      const listing = await store.list({ prefix: "id:" });
+      for (const blob of listing.blobs) {
+        const rawRec = await store.get(blob.key);
+        if (!rawRec) continue;
+        try {
+          const rec = JSON.parse(rawRec);
+          if (rec.verify_token === token) { memberId = rec.member_id; break; }
+        } catch { /* skip corrupt record */ }
+      }
+    }
+    if (!memberId) {
+      return page(404, "Link not recognized", "This verification link is invalid or has already been used. If you still need to verify your email, ask Dark Money to send you a fresh link.");
+    }
+    const raw = await store.get("id:" + memberId);
+    if (!raw) {
+      return page(404, "Link not recognized", "This verification link is invalid or has already been used. If you still need to verify your email, ask Dark Money to send you a fresh link.");
+    }
+    const m = JSON.parse(raw);
+    m.email_verified = true;
+    delete m.verify_token;
+    await store.set("id:" + memberId, JSON.stringify(m));
+    await store.delete("vtoken:" + token);
+    return page(200, "Email verified — you're all set", "Thanks — your email address is confirmed for your Dark Money membership. You can head back to the app.");
   }
 
   if (path === "/admin/members" && req.method === "GET") {
@@ -450,6 +618,17 @@ export default async (req) => {
     }
     for (const m of members) {
       m.has_password = !!m.pw;
+      m.email_verified = !!m.email_verified;
+      if (!m.email_verified) {
+        // Mint a verify token for members who don't have one yet (records
+        // that predate verification, or a failed join-time mint) so the
+        // owner can send the link manually. ensureVerifyToken persists the
+        // FULL record, so it must run before pw is stripped just below.
+        const tok = await ensureVerifyToken(store, m);
+        if (tok) m.verify_url = "https://api.strangefawkes.com/api/verify?token=" + tok;
+      } else {
+        delete m.verify_token;
+      }
       delete m.pw; // password hashes never leave the server, not even to the owner view
       let rec = null;
       const recRaw = await store.get("loyalty:" + m.member_id);
@@ -534,6 +713,53 @@ export default async (req) => {
     record.sent_at = new Date().toISOString();
     await store.set("payout:" + memberId, JSON.stringify(record));
     return json({ ok: true, member_id: memberId, sent_at: record.sent_at }, 200, origin);
+  }
+
+  // Payout identity codes (audit P0-3): before paying, the owner generates
+  // a one-off 6-digit code here and sends it to the member's stored email.
+  // The member quotes it back from that address — proof the payout request
+  // really comes from the account's owner. The code lives only on the
+  // member record (admin-visible) and in this route's response; it never
+  // appears in publicMember or any login payload.
+  if (path === "/admin/payout-code" && req.method === "POST") {
+    const adminKey = (typeof Netlify !== "undefined" && Netlify.env && Netlify.env.get("ADMIN_KEY")) || process.env.ADMIN_KEY || "";
+    const given = req.headers.get("x-admin-key") || "";
+    if (!adminKey || !given || given !== adminKey) {
+      return json({ ok: false, error: "unauthorized" }, 401, origin);
+    }
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "invalid_member" }, 404, origin);
+    const m = JSON.parse(raw);
+    const code = String((crypto.getRandomValues(new Uint32Array(1))[0] % 900000) + 100000);
+    m.payout_code = code;
+    m.payout_code_expires = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
+    m.payout_code_used = false;
+    await store.set("id:" + memberId, JSON.stringify(m));
+    return json({ ok: true, code, expires: m.payout_code_expires }, 200, origin);
+  }
+
+  if (path === "/admin/payout-code-clear" && req.method === "POST") {
+    const adminKey = (typeof Netlify !== "undefined" && Netlify.env && Netlify.env.get("ADMIN_KEY")) || process.env.ADMIN_KEY || "";
+    const given = req.headers.get("x-admin-key") || "";
+    if (!adminKey || !given || given !== adminKey) {
+      return json({ ok: false, error: "unauthorized" }, 401, origin);
+    }
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "invalid_member" }, 404, origin);
+    const m = JSON.parse(raw);
+    delete m.payout_code;
+    delete m.payout_code_expires;
+    delete m.payout_code_used;
+    await store.set("id:" + memberId, JSON.stringify(m));
+    return json({ ok: true, member_id: memberId }, 200, origin);
   }
 
   if (path === "/checkin" && req.method === "POST") {
