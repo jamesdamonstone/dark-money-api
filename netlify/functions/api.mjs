@@ -31,6 +31,19 @@
 //   GET  /api/admin/local-receipt?id=lc_xxx  header x-admin-key -> {ok, receipt} (the claim's receipt photo data URL)
 //   POST /api/admin/local-claim-decide {claim_id, decision} header x-admin-key -> {ok, claim} (approve credits the member's purchases as confirmed)
 //   GET  /api/health                                            -> {ok:true}
+//   --- Redesign (Nov 25, 2026): sessions + account self-service. Member routes
+//   below the line take the session token as Authorization: Bearer; the member
+//   ID alone is no longer a credential anywhere it can be avoided.
+//   GET  /api/session       (session)                             -> {ok, member (incl. own email), session_expires_at}
+//   POST /api/logout        (session)                             -> {ok} (burns the token)
+//   POST /api/change-password {current_password?, password} (session) -> {ok} (other sessions burned)
+//   POST /api/change-email  {new_email, current_password?} (session)  -> {ok, email} (new address starts unverified)
+//   POST /api/forgot-password {email}                             -> {ok} always (link mailed via /admin/mail-jobs)
+//   POST /api/reset-password {token, password}                    -> {ok} (1-hour single-use token; burns all sessions)
+//   GET  /api/reset?token=                                        -> HTML reset form
+//   GET  /api/admin/mail-jobs / POST /api/admin/mail-jobs-sent    -> pending outgoing mail for the owner's mail watch
+//   GET  /api/admin/export  header x-admin-key                    -> full raw dump of members + local stores (backup format 2)
+//   POST /api/admin/import  {stores} header x-admin-key           -> write an export back (restore; passwords survive)
 // Local (brick-and-mortar, James Nov 24, 2026): businesses pay a % on in-person
 // member purchases, verified by the shop's register QR + a receipt photo.
 // Same 70/30 split as online. Claims live in the "local" Blobs store; approval
@@ -62,7 +75,7 @@ function cors(origin) {
   return {
     "Access-Control-Allow-Origin": allow,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Admin-Key",
+    "Access-Control-Allow-Headers": "Content-Type, X-Admin-Key, Authorization, X-Member-Token",
     "Vary": "Origin",
   };
 }
@@ -235,6 +248,82 @@ async function checkPassword(password, rec) {
 function validPassword(p) {
   return typeof p === "string" && p.length >= 8 && p.length <= 200;
 }
+
+// Sessions (redesign, Nov 25, 2026): a successful login (or join) mints a
+// random session token, and the member routes take it as
+// "Authorization: Bearer <token>" instead of trusting the member ID —
+// the ID is printed as the sid on every link a member generates, so it
+// can no longer be the credential. Tokens live in their own Blobs store
+// so a registry restore never resurrects sessions. "Keep me logged in"
+// (remember, the default) = 90 days, sliding: a validation with less
+// than half the window left extends it back to a full 90 days, so an
+// active member — or their agent — effectively never has to log in
+// again. Without it: 24 hours, and the app keeps the token in
+// sessionStorage only. Logout and password resets burn tokens.
+const SESSION_REMEMBER_MS = 90 * 24 * 3600 * 1000;
+const SESSION_SHORT_MS = 24 * 3600 * 1000;
+
+function newSessionToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let t = "";
+  for (const b of bytes) t += ALPHABET[b % ALPHABET.length];
+  return t;
+}
+
+async function mintSession(sessStore, memberId, remember) {
+  for (let i = 0; i < 5; i++) {
+    const token = newSessionToken();
+    if (await sessStore.get("sess:" + token)) continue;
+    const now = Date.now();
+    const rec = { member_id: memberId, created_at: now, expires_at: now + (remember ? SESSION_REMEMBER_MS : SESSION_SHORT_MS), remember: !!remember };
+    await sessStore.set("sess:" + token, JSON.stringify(rec));
+    return { token, expires_at: rec.expires_at };
+  }
+  return null;
+}
+
+function sessionTokenFrom(req) {
+  const auth = req.headers.get("authorization") || "";
+  if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  return (req.headers.get("x-member-token") || "").trim();
+}
+
+// Resolve the caller's session to { token, member, expires_at, remember },
+// or null. Burns expired tokens; slides remembered sessions forward.
+async function requireSession(req, sessStore, store) {
+  const token = sessionTokenFrom(req);
+  if (!token) return null;
+  const raw = await sessStore.get("sess:" + token);
+  if (!raw) return null;
+  let rec;
+  try { rec = JSON.parse(raw); } catch { return null; }
+  const now = Date.now();
+  if (!rec.member_id || !rec.expires_at || rec.expires_at <= now) {
+    await sessStore.delete("sess:" + token);
+    return null;
+  }
+  if (rec.remember && rec.expires_at - now < SESSION_REMEMBER_MS / 2) {
+    rec.expires_at = now + SESSION_REMEMBER_MS;
+    await sessStore.set("sess:" + token, JSON.stringify(rec));
+  }
+  const mRaw = await store.get("id:" + rec.member_id);
+  if (!mRaw) return null;
+  return { token, member: JSON.parse(mRaw), expires_at: rec.expires_at, remember: !!rec.remember };
+}
+
+async function burnMemberSessions(sessStore, memberId, exceptToken) {
+  const listing = await sessStore.list({ prefix: "sess:" });
+  for (const blob of listing.blobs) {
+    if (exceptToken && blob.key === "sess:" + exceptToken) continue;
+    const raw = await sessStore.get(blob.key);
+    if (!raw) continue;
+    try { if (JSON.parse(raw).member_id === memberId) await sessStore.delete(blob.key); } catch { /* skip corrupt record */ }
+  }
+}
+
+const RESET_WINDOW_MS = 3600 * 1000;
+
 
 // Login throttling: failed-attempt timestamps live in the "security" Blobs
 // store, keyed per email and per client IP. After 5 failures for one email
@@ -468,6 +557,7 @@ export default async (req) => {
 
   const store = getStore({ name: "members", consistency: "strong" });
   const secStore = getStore({ name: "security", consistency: "strong" });
+  const sessStore = getStore({ name: "sessions", consistency: "strong" });
 
   // Admin gate, centralized: every /admin/* route needs the admin key.
   // Failed key attempts are counted per IP in the security store; past 20
@@ -570,7 +660,8 @@ export default async (req) => {
     if (refCode) await store.set("refcode:" + refCode, memberId);
     if (verifyToken) await store.set("vtoken:" + verifyToken, memberId);
 
-    return json({ ok: true, member_id: memberId, existing: false, app_url: APP_BASE + "#" + memberId }, 201, origin);
+    const joinSess = await mintSession(sessStore, memberId, data.remember !== false);
+    return json({ ok: true, member_id: memberId, existing: false, app_url: APP_BASE + "#" + memberId, ...(joinSess ? { session_token: joinSess.token, session_expires_at: joinSess.expires_at } : {}) }, 201, origin);
   }
 
   if (path === "/login" && req.method === "POST") {
@@ -608,7 +699,8 @@ export default async (req) => {
       if (!(await checkPassword(password, m.pw))) return fail("invalid_credentials", 401);
       await clearLoginFailures(secStore, email);
       await ensureRefCode(store, m);
-      return json({ ok: true, member: { ...publicMember(m), payout: m.payout, ...(await referralInfo(store, m.member_id)) } }, 200, origin);
+      const sess = await mintSession(sessStore, m.member_id, data.remember !== false);
+      return json({ ok: true, member: { ...publicMember(m), payout: m.payout, ...(await referralInfo(store, m.member_id)) }, ...(sess ? { session_token: sess.token, session_expires_at: sess.expires_at } : {}) }, 200, origin);
     }
 
     // Member-ID login (the original path). One generic failure for both unknown
@@ -623,7 +715,194 @@ export default async (req) => {
     if (m.pw) return json({ ok: false, error: "password_required" }, 401, origin);
     await clearLoginFailures(secStore, email);
     await ensureRefCode(store, m);
-    return json({ ok: true, member: { ...publicMember(m), payout: m.payout, ...(await referralInfo(store, m.member_id)) } }, 200, origin);
+    const sess = await mintSession(sessStore, m.member_id, data.remember !== false);
+    return json({ ok: true, member: { ...publicMember(m), payout: m.payout, ...(await referralInfo(store, m.member_id)) }, ...(sess ? { session_token: sess.token, session_expires_at: sess.expires_at } : {}) }, 200, origin);
+  }
+
+
+  if (path === "/session" && req.method === "GET") {
+    const s = await requireSession(req, sessStore, store);
+    if (!s) return json({ ok: false, error: "session_required" }, 401, origin);
+    await ensureRefCode(store, s.member);
+    return json({ ok: true, member: { ...publicMember(s.member), email: s.member.email, payout: s.member.payout, ...(await referralInfo(store, s.member.member_id)) }, session_expires_at: s.expires_at }, 200, origin);
+  }
+
+  if (path === "/logout" && req.method === "POST") {
+    const token = sessionTokenFrom(req);
+    if (token) await sessStore.delete("sess:" + token);
+    return json({ ok: true }, 200, origin);
+  }
+
+  // Change password (session-gated). Security measures: the current
+  // password is required once one is set; every OTHER session is burned
+  // (a password change is exactly when a stolen session should die); the
+  // change is written to the security event log.
+  if (path === "/change-password" && req.method === "POST") {
+    const s = await requireSession(req, sessStore, store);
+    if (!s) return json({ ok: false, error: "session_required" }, 401, origin);
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    if (!validPassword(data.password)) return json({ ok: false, error: "password_too_short" }, 400, origin);
+    const m = s.member;
+    if (m.pw) {
+      const current = typeof data.current_password === "string" ? data.current_password : "";
+      if (!current || !(await checkPassword(current, m.pw))) {
+        await logSecurityEvent(secStore, "password_change_failed", { email: m.email });
+        return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+      }
+    }
+    m.pw = await makePasswordRecord(data.password);
+    await store.set("id:" + m.member_id, JSON.stringify(m));
+    await burnMemberSessions(sessStore, m.member_id, s.token);
+    await logSecurityEvent(secStore, "password_changed", { email: m.email });
+    return json({ ok: true, member_id: m.member_id, has_password: true }, 200, origin);
+  }
+
+  // Change email (session-gated). Security measures: current password
+  // required once one is set; the new address starts UNVERIFIED with a
+  // fresh verify token (the mail watch sends the link); a notice job is
+  // queued for the OLD address so the owner hears about it out-of-band;
+  // the change is written to the security event log.
+  if (path === "/change-email" && req.method === "POST") {
+    const s = await requireSession(req, sessStore, store);
+    if (!s) return json({ ok: false, error: "session_required" }, 401, origin);
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    const m = s.member;
+    const newEmail = (data.new_email || "").toString().trim().toLowerCase().slice(0, 254);
+    if (!validEmail(newEmail)) return json({ ok: false, error: "email_invalid" }, 400, origin);
+    if (newEmail === (m.email || "").toLowerCase()) return json({ ok: false, error: "email_unchanged" }, 400, origin);
+    if (m.pw) {
+      const current = typeof data.current_password === "string" ? data.current_password : "";
+      if (!current || !(await checkPassword(current, m.pw))) {
+        await logSecurityEvent(secStore, "email_change_failed", { email: m.email });
+        return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+      }
+    }
+    const taken = await store.get("email:" + newEmail);
+    if (taken && taken !== m.member_id) return json({ ok: false, error: "email_taken" }, 409, origin);
+    const oldEmail = m.email;
+    await store.set("mailjob:notice:" + m.member_id + ":" + Date.now(), JSON.stringify({
+      type: "email_changed_notice", member_id: m.member_id, email: oldEmail, new_email: newEmail,
+      created_at: new Date().toISOString(),
+    }));
+    if (m.verify_token) await store.delete("vtoken:" + m.verify_token);
+    delete m.verify_token;
+    let verifyToken = null;
+    for (let i = 0; i < 5 && !verifyToken; i++) {
+      const candidate = newVerifyToken();
+      if (!(await store.get("vtoken:" + candidate))) verifyToken = candidate;
+    }
+    await store.delete("email:" + (oldEmail || "").toLowerCase());
+    m.email = newEmail;
+    m.email_verified = false;
+    if (verifyToken) m.verify_token = verifyToken;
+    await store.set("id:" + m.member_id, JSON.stringify(m));
+    await store.set("email:" + newEmail, m.member_id);
+    if (verifyToken) await store.set("vtoken:" + verifyToken, m.member_id);
+    await logSecurityEvent(secStore, "email_changed", { email: newEmail });
+    return json({ ok: true, member_id: m.member_id, email: newEmail, email_verified: false }, 200, origin);
+  }
+
+  // Password recovery. The request ALWAYS answers ok (no account
+  // oracle). A fresh request replaces any earlier token; tokens live
+  // one hour and are single-use; the link itself is delivered by the
+  // owner's mail watch (the API sends no mail) through /admin/mail-jobs.
+  // Requests are throttled per IP (10/hour) and per email (3/hour).
+  if (path === "/forgot-password" && req.method === "POST") {
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    const email = (data.email || "").toString().trim().toLowerCase().slice(0, 254);
+    const ip = clientIp(req);
+    const ipList = await loadTsList(secStore, "reset:ip:" + ip, RESET_WINDOW_MS);
+    if (validEmail(email) && ipList.length < 10) {
+      const memberId = await store.get("email:" + email);
+      if (memberId) {
+        const emList = await loadTsList(secStore, "reset:email:" + email, RESET_WINDOW_MS);
+        if (emList.length < 3) {
+          await bumpTsList(secStore, "reset:ip:" + ip, RESET_WINDOW_MS);
+          await bumpTsList(secStore, "reset:email:" + email, RESET_WINDOW_MS);
+          const raw = await store.get("id:" + memberId);
+          if (raw) {
+            const prevRaw = await store.get("reset:" + memberId);
+            if (prevRaw) { try { const prev = JSON.parse(prevRaw); if (prev.token) await store.delete("rtoken:" + prev.token); } catch { /* ignore */ } }
+            const token = newSessionToken();
+            const expires = Date.now() + RESET_WINDOW_MS;
+            await store.set("rtoken:" + token, memberId);
+            await store.set("reset:" + memberId, JSON.stringify({ token, expires_at: expires }));
+            await store.set("mailjob:reset:" + memberId, JSON.stringify({
+              type: "password_reset", member_id: memberId, email,
+              reset_url: "https://api.strangefawkes.com/api/reset?token=" + token,
+              created_at: new Date().toISOString(), expires_at: new Date(expires).toISOString(),
+            }));
+            await logSecurityEvent(secStore, "password_reset_requested", { email });
+          }
+        }
+      }
+    }
+    return json({ ok: true }, 200, origin);
+  }
+
+  if (path === "/reset-password" && req.method === "POST") {
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    if (!validPassword(data.password)) return json({ ok: false, error: "password_too_short" }, 400, origin);
+    const token = (data.token || "").toString().trim();
+    const memberId = token ? await store.get("rtoken:" + token) : null;
+    if (!memberId) return json({ ok: false, error: "invalid_token" }, 400, origin);
+    const recRaw = await store.get("reset:" + memberId);
+    let rec = null;
+    if (recRaw) { try { rec = JSON.parse(recRaw); } catch { rec = null; } }
+    if (!rec || rec.token !== token || !rec.expires_at || rec.expires_at <= Date.now()) {
+      await store.delete("rtoken:" + token);
+      await store.delete("reset:" + memberId);
+      return json({ ok: false, error: "invalid_token" }, 400, origin);
+    }
+    const raw = await store.get("id:" + memberId);
+    if (!raw) return json({ ok: false, error: "invalid_token" }, 400, origin);
+    const m = JSON.parse(raw);
+    m.pw = await makePasswordRecord(data.password);
+    await store.set("id:" + memberId, JSON.stringify(m));
+    await store.delete("rtoken:" + token);
+    await store.delete("reset:" + memberId);
+    await store.delete("mailjob:reset:" + memberId);
+    await burnMemberSessions(sessStore, memberId, null);
+    await clearLoginFailures(secStore, m.email);
+    await logSecurityEvent(secStore, "password_reset", { email: m.email });
+    return json({ ok: true }, 200, origin);
+  }
+
+  if (path === "/reset" && req.method === "GET") {
+    const page = (status, title, inner) => new Response(
+      "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
+      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+      "<title>" + title + " — Dark Money</title></head>" +
+      "<body style=\"margin:0;font-family:system-ui,-apple-system,sans-serif;background:#0e1420;color:#e8edf5\">" +
+      "<main style=\"max-width:430px;margin:12vh auto 0;padding:28px 24px;text-align:center\">" +
+      "<h1 style=\"font-size:1.5rem;margin:0 0 12px\">" + title + "</h1>" + inner +
+      "</main></body></html>",
+      { status, headers: { "Content-Type": "text/html; charset=utf-8", ...cors(origin) } }
+    );
+    const token = (url.searchParams.get("token") || "").trim();
+    let valid = false;
+    if (/^[A-Za-z0-9]{32}$/.test(token)) {
+      const memberId = await store.get("rtoken:" + token);
+      if (memberId) {
+        const recRaw = await store.get("reset:" + memberId);
+        if (recRaw) { try { const rec = JSON.parse(recRaw); valid = rec.token === token && rec.expires_at > Date.now(); } catch { valid = false; } }
+      }
+    }
+    if (!valid) {
+      return page(404, "Link not recognized", "<p style=\"color:#aeb9c9;line-height:1.55\">This reset link is invalid or has expired. Request a fresh one from the app's login screen.</p>");
+    }
+    const form =
+      "<p style=\"color:#aeb9c9;line-height:1.55;margin:0 0 18px\">Choose a new password for your Dark Money account.</p>" +
+      "<input id=\"np\" type=\"password\" placeholder=\"New password (8+ characters)\" autocomplete=\"new-password\" style=\"width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #33415c;background:#141d2e;color:#e8edf5;margin-bottom:10px\">" +
+      "<input id=\"np2\" type=\"password\" placeholder=\"Repeat it\" autocomplete=\"new-password\" style=\"width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #33415c;background:#141d2e;color:#e8edf5;margin-bottom:14px\">" +
+      "<button id=\"go\" style=\"padding:12px 22px;border:0;border-radius:10px;background:#c9a227;color:#14100a;font-weight:700;cursor:pointer\">Set new password</button>" +
+      "<p id=\"msg\" style=\"color:#aeb9c9;line-height:1.55;margin:14px 0 0\"></p>" +
+      "<script>var T=" + JSON.stringify(token) + ";document.getElementById('go').addEventListener('click',function(){var p1=document.getElementById('np').value||'',p2=document.getElementById('np2').value||'',msg=document.getElementById('msg');if(p1.length<8){msg.textContent='Use at least 8 characters.';return;}if(p1!==p2){msg.textContent='The two passwords don\'t match.';return;}fetch('/api/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:T,password:p1})}).then(function(r){return r.json();}).then(function(j){if(j&&j.ok){msg.textContent='Password changed. Open the Dark Money app and log in with your new password.';}else{msg.textContent='That link no longer works — request a fresh reset from the app.';}}).catch(function(){msg.textContent='Could not reach the service — try again in a moment.';});});</" + "script>";
+    return page(200, "Reset your password", form);
   }
 
   if (path === "/set-password" && req.method === "POST") {
@@ -665,7 +944,10 @@ export default async (req) => {
       const found = email ? await store.get("email:" + email) : null;
       return json({ ok: true, existing: !!found }, 200, origin);
     }
+    const sess = await requireSession(req, sessStore, store);
+    if (!sess) return json({ ok: false, error: "session_required" }, 401, origin);
     if (!memberId) return json({ ok: false, error: "not_found" }, 404, origin);
+    if (memberId !== sess.member.member_id) return json({ ok: false, error: "session_required" }, 401, origin);
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
     const m = JSON.parse(raw);
@@ -828,8 +1110,14 @@ export default async (req) => {
     // email on the account, not the member ID alone — the ID is printed
     // as the sid on every link a member generates. (The payout itself is
     // still protected by the emailed payout-code check at payment time.)
-    const email = (data.email || "").toString().trim().toLowerCase().slice(0, 254);
-    if (!email || email !== (m.email || "").toLowerCase()) return json({ ok: false, error: "email_mismatch" }, 401, origin);
+    // Redesign (Nov 25, 2026): a valid session for this member is the
+    // normal proof; the email match remains as a transition fallback for
+    // app copies cached before sessions shipped.
+    const sess = await requireSession(req, sessStore, store);
+    if (!(sess && sess.member.member_id === memberId)) {
+      const email = (data.email || "").toString().trim().toLowerCase().slice(0, 254);
+      if (!email || email !== (m.email || "").toLowerCase()) return json({ ok: false, error: "email_mismatch" }, 401, origin);
+    }
 
     // One open request per member — a second tap returns the existing request.
     const existingRaw = await store.get("payout:" + memberId);
@@ -936,9 +1224,10 @@ export default async (req) => {
     let data;
     try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
 
-    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    const sess = await requireSession(req, sessStore, store);
+    if (!sess) return json({ ok: false, error: "session_required" }, 401, origin);
+    const memberId = sess.member.member_id;
     const date = (data.date || "").toString().trim().slice(0, 10);
-    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
     if (!validDay(date)) return json({ ok: false, error: "invalid_date" }, 400, origin);
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "invalid_member" }, 404, origin);
@@ -977,9 +1266,10 @@ export default async (req) => {
   }
 
   if (path === "/loyalty" && req.method === "GET") {
-    const memberId = (url.searchParams.get("id") || "").trim();
+    const sess = await requireSession(req, sessStore, store);
+    if (!sess) return json({ ok: false, error: "session_required" }, 401, origin);
+    const memberId = sess.member.member_id;
     const date = (url.searchParams.get("date") || "").trim().slice(0, 10);
-    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
     let rec = null;
@@ -990,8 +1280,9 @@ export default async (req) => {
   }
 
   if (path === "/purchases" && req.method === "GET") {
-    const memberId = (url.searchParams.get("id") || "").trim();
-    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    const sess = await requireSession(req, sessStore, store);
+    if (!sess) return json({ ok: false, error: "session_required" }, 401, origin);
+    const memberId = sess.member.member_id;
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
     let purchases = [];
@@ -1115,6 +1406,71 @@ export default async (req) => {
     } catch { /* sweep is best-effort only */ }
   }
 
+
+  // Pending outgoing mail (password-reset links, email-change notices).
+  // The owner's mail watch reads these, sends from the business mailbox,
+  // and marks each sent. The API itself sends no mail.
+  if (path === "/admin/mail-jobs" && req.method === "GET") {
+    const listing = await store.list({ prefix: "mailjob:" });
+    const jobs = [];
+    for (const blob of listing.blobs) {
+      const raw = await store.get(blob.key);
+      if (!raw) continue;
+      try { jobs.push({ key: blob.key, ...JSON.parse(raw) }); } catch { /* skip corrupt record */ }
+    }
+    return json({ ok: true, count: jobs.length, jobs }, 200, origin);
+  }
+
+  if (path === "/admin/mail-jobs-sent" && req.method === "POST") {
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    const key = (data.key || "").toString();
+    if (!key.startsWith("mailjob:")) return json({ ok: false, error: "invalid_job" }, 400, origin);
+    await store.delete(key);
+    return json({ ok: true }, 200, origin);
+  }
+
+  // Full-fidelity backup (format 2): every key of the members and local
+  // stores, exactly as stored — password hashes, verify tokens, loyalty,
+  // purchases, payout queue, claims and receipts included. A restore is
+  // /admin/import writing the same keys back. Sessions and security logs
+  // are deliberately NOT exported: sessions should not survive a
+  // restore, and the logs are ephemeral.
+  if (path === "/admin/export" && req.method === "GET") {
+    const dump = async (st) => {
+      const out = {};
+      const listing = await st.list({ prefix: "" });
+      for (const blob of listing.blobs) {
+        const v = await st.get(blob.key);
+        if (v !== null && v !== undefined) out[blob.key] = v;
+      }
+      return out;
+    };
+    return json({ ok: true, format: 2, exported_at: new Date().toISOString(), stores: { members: await dump(store), local: await dump(localStore) } }, 200, origin);
+  }
+
+  if (path === "/admin/import" && req.method === "POST") {
+    let data;
+    try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
+    const storesIn = data && data.stores;
+    if (!storesIn || typeof storesIn !== "object") return json({ ok: false, error: "invalid_import" }, 400, origin);
+    const targets = { members: store, local: localStore };
+    const counts = {};
+    for (const name of Object.keys(targets)) {
+      const entries = storesIn[name];
+      if (!entries || typeof entries !== "object") continue;
+      const keys = Object.keys(entries);
+      if (keys.length > 5000) return json({ ok: false, error: "invalid_import" }, 400, origin);
+      let n = 0;
+      for (const k of keys) {
+        await targets[name].set(k, typeof entries[k] === "string" ? entries[k] : JSON.stringify(entries[k]));
+        n++;
+      }
+      counts[name] = n;
+    }
+    return json({ ok: true, counts }, 200, origin);
+  }
+
   if (path === "/local/businesses" && req.method === "GET") {
     const businesses = (await loadBusinesses()).filter((b) => b.active !== false).map(publicBusiness);
     return json({ ok: true, businesses }, 200, origin);
@@ -1125,7 +1481,9 @@ export default async (req) => {
     let data;
     try { data = await req.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400, origin); }
 
-    const memberId = (data.member_id || "").toString().trim().slice(0, 40);
+    const sess = await requireSession(req, sessStore, store);
+    if (!sess) return json({ ok: false, error: "session_required" }, 401, origin);
+    const memberId = sess.member.member_id;
     const businessId = (data.business_id || "").toString().trim().slice(0, 60);
     const amount = money2(data.amount);
     const receipt = typeof data.receipt === "string" ? data.receipt : "";
@@ -1175,8 +1533,9 @@ export default async (req) => {
   }
 
   if (path === "/local/claims" && req.method === "GET") {
-    const memberId = (url.searchParams.get("id") || "").trim();
-    if (!/^dm_[A-Za-z0-9]{10}$/.test(memberId)) return json({ ok: false, error: "invalid_member" }, 400, origin);
+    const sess = await requireSession(req, sessStore, store);
+    if (!sess) return json({ ok: false, error: "session_required" }, 401, origin);
+    const memberId = sess.member.member_id;
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "not_found" }, 404, origin);
     const claims = (await loadClaims())
