@@ -3,7 +3,7 @@
 //   POST /comms-api/message   {from_name, contact?, message, token?} -> {ok, conversation_id, token}
 //        No token (or unknown token): starts a new conversation and returns its token.
 //        With a valid token: appends the message to that conversation.
-//   GET  /comms-api/replies?token=nc_xxx                             -> {ok, conversation_id, replies:[{text, at}]}
+//   GET  /comms-api/replies   header Authorization: Bearer <token>  -> {ok, conversation_id, replies:[{text, at}]}
 //        Returns Navi's replies the caller has not seen yet, and marks them seen.
 //   GET  /comms-api/admin/inbox   header x-admin-key: $ADMIN_KEY     -> {ok, count, conversations}
 //   POST /comms-api/admin/reply   {conversation_id, message}  (admin) -> {ok}
@@ -21,7 +21,7 @@ function cors() {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Admin-Key",
+    "Access-Control-Allow-Headers": "Content-Type, X-Admin-Key, Authorization, X-Comms-Token",
   };
 }
 
@@ -113,7 +113,10 @@ export default async (req) => {
 
   // ---- public: an agent picks up Navi's replies ----
   if (path === "/replies" && req.method === "GET") {
-    const token = url.searchParams.get("token") || "";
+    // Token via header only (security fix, Nov 24, 2026): a credential in
+    // the URL query string leaks into proxy, CDN and server logs.
+    const auth = req.headers.get("authorization") || "";
+    const token = (auth.toLowerCase().startsWith("bearer ") ? auth.slice(7) : (req.headers.get("x-comms-token") || "")).trim();
     if (!token) return json({ ok: false, error: "token_required" }, 400);
     const convId = await store.get("tok:" + token, { type: "text" });
     if (!convId) return json({ ok: false, error: "unknown_token" }, 404);

@@ -5,14 +5,17 @@
 //                           joins are throttled per IP; new members start email_verified:false with a verify_token)
 //   POST /api/login         {email, member_id} or {email, password} -> {ok, member} (email + ID must match, or the member's password;
 //                           ID login is refused with "password_required" once the member has a password; failed logins are throttled)
-//   POST /api/set-password  {member_id, password}               -> {ok} (sets/replaces the member's login password; the member ID is the credential, same as every member route)
+//   POST /api/set-password  {member_id, email, password, current_password?} -> {ok} (sets/replaces the login password;
+ //                           requires the account's email, plus the current password once one is set — the member ID
+ //                           alone is printed as the sid on every member link, so it is not enough proof on its own)
 //   GET  /api/member?id=dm_xxx                                  -> {ok, member} (public fields only)
 //   GET  /api/member?email=a@b.c                                -> {ok, existing} (existence ONLY — no name, no ID; audit P0-1)
 //   GET  /api/verify?token=<verify_token>                       -> HTML page (marks the member's email verified; token is single-use)
 //   GET  /api/admin/members  header x-admin-key: $ADMIN_KEY     -> {ok, count, members, totals} (unverified members carry verify_token + verify_url)
 //   POST /api/admin/payout-code {member_id}  header x-admin-key -> {ok, code, expires} (6-digit payout identity code, 48h; audit P0-3)
 //   POST /api/admin/payout-code-clear {member_id} header x-admin-key -> {ok} (clears the payout code after a payout completes)
-//   POST /api/payout-request {member_id}                        -> {ok, requested_at} (queues a payout request; no money moves)
+//   POST /api/payout-request {member_id, email}                 -> {ok, requested_at} (queues a payout request; no money moves;
+ //                           the email must match the account — the member ID alone is not enough proof)
 //   GET  /api/admin/payout-requests  header x-admin-key         -> {ok, count, requests}
 //   POST /api/admin/payout-sent {member_id}  header x-admin-key -> {ok} (marks a request sent, clearing the queue entry)
 //   POST /api/checkin       {member_id, date}                   -> {ok, streak, bonus_pct, share_pct} (daily loyalty check-in; date = member's local YYYY-MM-DD)
@@ -633,6 +636,19 @@ export default async (req) => {
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "invalid_member" }, 404, origin);
     const m = JSON.parse(raw);
+    // Security fix (Nov 24, 2026): the member ID is printed as the sid on
+    // every link a member generates, so it can no longer be the ONLY proof
+    // for changing the account's password. The caller must also give the
+    // email on the account, and — once a password exists — the current
+    // password. Before this, anyone holding a member's ID could replace
+    // their password and lock them out of the password path.
+    const email = (data.email || "").toString().trim().toLowerCase().slice(0, 254);
+    if (!email || email !== (m.email || "").toLowerCase()) return json({ ok: false, error: "email_mismatch" }, 401, origin);
+    if (m.pw) {
+      const current = typeof data.current_password === "string" ? data.current_password : "";
+      if (!current) return json({ ok: false, error: "current_password_required" }, 401, origin);
+      if (!(await checkPassword(current, m.pw))) return json({ ok: false, error: "invalid_credentials" }, 401, origin);
+    }
     m.pw = await makePasswordRecord(data.password);
     await store.set("id:" + memberId, JSON.stringify(m));
     return json({ ok: true, member_id: memberId, has_password: true }, 200, origin);
@@ -807,6 +823,13 @@ export default async (req) => {
     const raw = await store.get("id:" + memberId);
     if (!raw) return json({ ok: false, error: "invalid_member" }, 404, origin);
     const m = JSON.parse(raw);
+
+    // Security fix (Nov 24, 2026): a payout request must come with the
+    // email on the account, not the member ID alone — the ID is printed
+    // as the sid on every link a member generates. (The payout itself is
+    // still protected by the emailed payout-code check at payment time.)
+    const email = (data.email || "").toString().trim().toLowerCase().slice(0, 254);
+    if (!email || email !== (m.email || "").toLowerCase()) return json({ ok: false, error: "email_mismatch" }, 401, origin);
 
     // One open request per member — a second tap returns the existing request.
     const existingRaw = await store.get("payout:" + memberId);
